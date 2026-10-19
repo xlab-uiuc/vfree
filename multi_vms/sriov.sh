@@ -35,12 +35,13 @@ if [[ "$pf_drv" != "mlx5_core" ]]; then
     echo "PF bound to mlx5_core"
 fi
 
-echo 0 > "$PF_SYSFS/sriov_numvfs"
-echo "$NUM_VFS" > "$PF_SYSFS/sriov_numvfs"
-echo "Created $NUM_VFS VFs"
-
 modprobe -q vfio-pci
 echo 1 | sudo tee /sys/module/vfio_pci/parameters/enable_sriov
+
+echo 0 > "$PF_SYSFS/sriov_numvfs"
+devlink dev eswitch set "pci/$PF_BDF" mode legacy
+echo "$NUM_VFS" > "$PF_SYSFS/sriov_numvfs"
+echo "Created $NUM_VFS VFs"
 
 for i in $(seq 0 $((NUM_VFS - 1))); do
     vf_bdf=$(basename "$(readlink -f "$PF_SYSFS/virtfn${i}")")
