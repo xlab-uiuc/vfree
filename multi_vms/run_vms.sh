@@ -12,12 +12,13 @@ NUM_ACTIVE_CORES="12"
 NUM_FLOWS="12"
 REUSE=0
 SKIP_RESET_HOST=0
+PERF_TRACING="off" # off/vm0/all; one host recording whenever enabled
 
 # --- Hardcoded experiment config ---
 GIT_REPO="/home/schai/viommu"
 GIT_BRANCH="multi-cross-numa-tx"
-# VM_SCRIPT="cd /home/schai/viommu/scripts/sosp24-experiments; ./many_vm_flows_exp.sh"
-VM_SCRIPT="cd /home/schai/viommu/scripts/sosp24-experiments; ./many_vm_tx_flows_exp.sh"
+VM_SCRIPT="cd /home/schai/viommu/scripts/sosp24-experiments; ./many_vm_flows_exp.sh"
+# VM_SCRIPT="cd /home/schai/viommu/scripts/sosp24-experiments; ./many_vm_tx_flows_exp.sh"
 
 # --- Host paths (this script runs ON the host) ---
 HOST_FandS_ABS=$(dirname "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")")
@@ -96,6 +97,7 @@ usage() {
 	  --reuse             Reuse already-defined VMs (skip undefine/define, just start)
 	  --skip-reset-host   Skip host reset (host setup will still run)
 	  --boot-timeout N    Seconds to wait for SSH per VM (default: $BOOT_TIMEOUT)
+	  --perf-tracing MODE Record host and selected guests: off, vm0, all (default: off)
 	  -h, --help          Show this help
 	USAGE
 }
@@ -110,10 +112,16 @@ while [[ $# -gt 0 ]]; do
 	--reuse)            REUSE=1;           shift   ;;
 	--skip-reset-host)  SKIP_RESET_HOST=1; shift   ;;
 	--boot-timeout)  BOOT_TIMEOUT="$2"; shift 2 ;;
+	--perf-tracing)  PERF_TRACING="$2"; shift 2 ;;
 	-h|--help)       usage; exit 0      ;;
 	*)               echo "Error: unknown option '$1'" >&2; usage >&2; exit 1 ;;
 	esac
 done
+
+case "$PERF_TRACING" in
+off|vm0|all) ;;
+*) echo "Error: --perf-tracing must be off, vm0, or all" >&2; exit 1 ;;
+esac
 
 if [[ -z "$NUM_TOTAL_CORES" || -z "$NUM_FLOWS" || -z "$NUM_VMS" || -z "$NUM_ACTIVE_CORES" ]]; then
 	echo "Error: --num-total-cores, --num-active-cores, --num-flows, and --num-vms are required" >&2
@@ -475,6 +483,7 @@ echo "  Branch:    ${GIT_BRANCH}"
 echo "  Total Cores:  ${NUM_TOTAL_CORES}"
 echo "  Active Cores: ${NUM_ACTIVE_CORES}"
 echo "  Flows:     ${NUM_FLOWS}"
+echo "  Perf:      ${PERF_TRACING}"
 echo "  Exp name:  ${EXP_NAME}"
 echo "  MTU:       ${MTU}"
 echo "  Ring buf:  ${RING_BUFFER_SIZE}"
@@ -649,10 +658,22 @@ for ((i = 0; i < NUM_VMS; i++)); do
 	ip=$(vm_ip "$i")
 	name="${vm_names[$i]}"
 
+	# VM0 starts the single host recorder after its guest warmup. Other VMs
+	# only start their own guest recorder, avoiding duplicate host samples.
+	perf_guest=0
+	perf_host=0
+	if [[ "$PERF_TRACING" == all || ( "$PERF_TRACING" == vm0 && "$i" -eq 0 ) ]]; then
+		perf_guest=1
+	fi
+	if [[ "$PERF_TRACING" != off && "$i" -eq 0 ]]; then
+		perf_host=1
+	fi
+
 	vm_cmd="${VM_SCRIPT} --vm-name ${name} --num-cores ${NUM_ACTIVE_CORES} --num-flows ${NUM_FLOWS} \
 		--exp-name ${EXP_NAME}-${name} \
 		--host-ip ${HOST_IP} --host-ssh-uname ${HOST_SSH_UNAME} \
-		--host-home ${HOST_HOME} --host-results-dir ${HOST_RESULTS_DIR}"
+		--host-home ${HOST_HOME} --host-results-dir ${HOST_RESULTS_DIR} \
+		--perf-tracing ${perf_guest} --perf-host-tracing ${perf_host}"
 	ssh $SSH_OPTS "$SSH_USER@$ip" "$vm_cmd" &>"${name}_experiment.log" &
 	ssh_pids+=($!)
 	echo "  Launched on ${name} (${ip}), log -> ${name}_experiment.log"
@@ -664,8 +685,8 @@ log_info "All experiments launched. Waiting for completion..."
 any_failed=false
 for ((i = 0; i < NUM_VMS; i++)); do
 	name="${vm_names[$i]}"
-	wait "${ssh_pids[$i]}"
-	rc=$?
+	rc=0
+	wait "${ssh_pids[$i]}" || rc=$?
 	if [[ $rc -eq 0 ]]; then
 		echo "  ${name}: finished (exit 0)"
 	else

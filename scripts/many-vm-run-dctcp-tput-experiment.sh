@@ -14,12 +14,15 @@ GUEST_MLC_DIR_REL="mlc/Linux"
 FTRACE_BUFFER_SIZE_KB=20000
 FTRACE_OVERWRITE_ON_FULL=0 # 0=no overwrite (tracing stops when full), 1=overwrite
 PERF_TRACING_ENABLED=0
+PERF_TRACING_HOST_ENABLED=0
 
 # --- Base Directory Paths (Relative to respective home directories) ---
 SCRIPT_DIR=$(dirname "$0")
 GUEST_FandS_REL=$(basename $(realpath "$SCRIPT_DIR/../"))
 GUEST_PERF_REL="linux-6.12.9/tools/perf/perf"
 CLIENT_FandS_REL="Fast-and-Safe-IO-Memory-Protection"
+
+HOST_PERF="/home/lbalara/viommu/linux-6.12.9/tools/perf/perf"
 
 # --- F and S Directory Paths (Relative to respective F and S directories) ---
 GUEST_SETUP_DIR_REL="utils"
@@ -106,6 +109,9 @@ help() {
 	echo "Host Configuration:"
 	echo "    [ --host-home <path> (Host home directory) ]"
 	echo "    [ --host-ip <ip> (IP address of the host) ]"
+	echo "    [ --host-ssh-name <user> (SSH user on host) ]"
+	echo "    [ --perf-tracing <0|1> (Record this guest; default: 0) ]"
+	echo "    [ --perf-host-tracing <0|1> (VM0 only: record host; default: 0) ]"
 	echo
 	echo "Experiment Parameters:"
 	echo "    [ --vm-id <id> (Unique VM identifier for session names/ports; default: 0) ]"
@@ -139,7 +145,7 @@ help() {
 SHORT_OPTS="n:c:N:C:e:m:d:b:r:h"
 LONG_OPTS="guest-home:,guest-ip:,guest-intf:,guest-bus:,guest-num:,guest-cpu-mask:,\
 client-home:,client-ip:,client-intf:,client-num:,client-cpu-mask:,\
-host-home:,host-ip:,\
+host-home:,host-ip:,host-ssh-name:,perf-tracing:,perf-host-tracing:,\
 vm-id:,exp-name:,mtu:,ddio:,bandwidth:,ring-buffer:,mlc-cores:,socket-buf:,dur:,runs:,ebpf-tracing:,mem-stats:,\
 client-ssh-name:,client-ssh-host:,client-ssh-use-pass:,client-ssh-pass:,client-ssh-ifile:,help"
 
@@ -165,6 +171,9 @@ while :; do
 	-C | --client-cpu-mask) CLIENT_CPU_MASK="$2"; shift 2 ;;
 	--host-home) HOST_HOME="$2"; shift 2 ;;
 	--host-ip) HOST_IP="$2"; shift 2 ;;
+	--host-ssh-name) HOST_SSH_UNAME="$2"; shift 2 ;;
+	--perf-tracing) PERF_TRACING_ENABLED="$2"; shift 2 ;;
+	--perf-host-tracing) PERF_TRACING_HOST_ENABLED="$2"; shift 2 ;;
 	--vm-id) VM_ID="$2"; shift 2 ;;
 	-e | --exp-name) EXP_NAME="$2"; shift 2 ;;
 	-m | --mtu) MTU="$2"; shift 2 ;;
@@ -200,6 +209,7 @@ INIT_PORT=$((3000 + VM_ID * 100))
 
 # Only trace on vm0
 if [ "$VM_ID" -ne 0 ]; then
+	PERF_TRACING_HOST_ENABLED=0
   EBPF_TRACING_HOST_ENABLED=0
 	EBPF_TRACING_ENABLED=0 
 fi
@@ -319,6 +329,12 @@ cleanup() {
 		sudo pkill -9 -f "$GUEST_PERF record" 2>/dev/null || true
 	fi
 
+	if [ "$PERF_TRACING_HOST_ENABLED" -eq 1 ]; then
+		log_info "Killing remote 'perf record' on HOST ($HOST_IP)..."
+		$SSH_HOST_CMD \
+		    "sudo pkill -SIGINT -f '^$HOST_PERF record'; sleep 1; sudo pkill -9 -f '^$HOST_PERF record'" || true
+	fi
+
 	if [ "$EBPF_TRACING_ENABLED" -eq 1 ]; then
 		log_info "Stopping guest eBPF tracers..."
 		guest_loader_basename=$(basename "$EBPF_GUEST_LOADER")
@@ -427,6 +443,7 @@ host_reports_dir_remote="${HOST_SETUP_DIR}/reports/${EXP_NAME}-RUN-${j}"
 client_reports_dir_remote="${CLIENT_SETUP_DIR}/reports/${EXP_NAME}-RUN-${j}"
 
 perf_guest_data_file="${current_guest_reports_dir}/perf_guest_cpu.data"
+perf_host_data_file_remote="${host_reports_dir_remote}/perf_host_cpu.data"
 iova_ftrace_guest_output_file="${current_guest_reports_dir}/iova_ftrace_guest.txt"
 ebpf_guest_stats="${current_guest_reports_dir}/ebpf_guest_stats.csv"
 guest_server_app_log_file="${current_guest_reports_dir}/server_app.log"
@@ -517,10 +534,17 @@ sudo sh -c 'echo > /sys/kernel/debug/tracing/trace'
 sudo sh -c 'echo 1 > /sys/kernel/debug/tracing/tracing_on'
 log_info "GUEST ftrace is ON."
 
-# --- Start Guest Perf (if enabled) ---
+# --- Start Main Profiling & Logging Phase ---
 if [ "$PERF_TRACING_ENABLED" -eq 1 ]; then
-	log_info "Starting GUEST perf record (CPU profiling)..."
-	sudo "$GUEST_PERF" record -F 99 -a -g --call-graph dwarf -o "$perf_guest_data_file" -- sleep "$PROFILING_LOGGING_DUR_S" &
+    log_info "Starting GUEST perf record (CPU profiling)..."
+    sudo "$GUEST_PERF" record -F 99 -a -g --call-graph dwarf -o "$perf_guest_data_file" -- sleep "$PROFILING_LOGGING_DUR_S" \
+        >"${current_guest_reports_dir}/perf_guest_record.log" 2>&1 &
+fi
+
+if [ "$PERF_TRACING_HOST_ENABLED" -eq 1 ]; then
+    log_info "Starting HOST perf record (CPU profiling) on $HOST_IP..."
+    host_perf_cmd="mkdir -p '$host_reports_dir_remote'; '$HOST_PERF' record -F 99 -a -g --call-graph dwarf -o '$perf_host_data_file_remote' -- sleep '$PROFILING_LOGGING_DUR_S' >'$host_reports_dir_remote/perf_host_record.log' 2>&1"
+    $SSH_HOST_CMD "screen -dmS perf_screen sudo bash -c \"$host_perf_cmd\""
 fi
 
 # --- Start Client-side Logging (VM-specific screen session + output dir) ---
@@ -594,6 +618,16 @@ log_info "############################################################"
 
 # --- Post-run cleanup ---
 cleanup
+
+# Decode before the host destroys the guest, while its symbols are available.
+if [ "$PERF_TRACING_ENABLED" -eq 1 ]; then
+    sudo "$GUEST_PERF" script -i "$perf_guest_data_file" >"${current_guest_reports_dir}/perf_guest_cpu.stacks" \
+        2>>"${current_guest_reports_dir}/perf_guest_record.log" || exit 1
+fi
+if [ "$PERF_TRACING_HOST_ENABLED" -eq 1 ]; then
+    $SSH_HOST_CMD "sudo bash -c \"'$HOST_PERF' script -i '$perf_host_data_file_remote' >'$host_reports_dir_remote/perf_host_cpu.stacks' 2>>'$host_reports_dir_remote/perf_host_record.log' && chmod a+r '$perf_host_data_file_remote'\"" || exit 1
+fi
+
 post_exp_cleanup
 
 cd "$SCRIPT_DIR" || exit 1

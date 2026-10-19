@@ -17,6 +17,8 @@ HOST_IP_ARG=""
 HOST_SSH_UNAME_ARG=""
 HOST_HOME_ARG=""
 HOST_RESULTS_DIR_ARG=""
+PERF_TRACING=0
+PERF_HOST_TRACING=0
 
 while [[ $# -gt 0 ]]; do
 	case "$1" in
@@ -28,6 +30,8 @@ while [[ $# -gt 0 ]]; do
 	--host-ssh-uname)   HOST_SSH_UNAME_ARG="$2";   shift 2 ;;
 	--host-home)        HOST_HOME_ARG="$2";        shift 2 ;;
 	--host-results-dir) HOST_RESULTS_DIR_ARG="$2"; shift 2 ;;
+	--perf-tracing)     PERF_TRACING="$2";         shift 2 ;;
+	--perf-host-tracing) PERF_HOST_TRACING="$2";   shift 2 ;;
 	--dry)              DRY_RUN=1;                 shift   ;;
 	*)                  shift                      ;;
 	esac
@@ -35,9 +39,15 @@ done
 
 if [[ -z "$VM_NAME" || -z "$NUM_CORES" || -z "$NUM_FLOWS" || -z "$EXP_NAME" ]]; then
 	echo "Usage: $0 --vm-name <n> --num-cores <N> --num-flows <N> --exp-name <name> [--dry]" >&2
+	echo "  Optional: --perf-tracing <0|1> --perf-host-tracing <0|1>" >&2
 	echo "  Optional: --host-ip <ip> --host-ssh-uname <user> --host-home <path> --host-results-dir <path>" >&2
 	exit 1
 fi
+
+case "${PERF_TRACING}:${PERF_HOST_TRACING}" in
+0:0|0:1|1:0|1:1) ;;
+*) echo "ERROR: perf tracing flags must be 0 or 1" >&2; exit 1 ;;
+esac
 
 # --- Derive VM index from name (trailing vmN) ---
 if [[ "$VM_NAME" =~ vm([0-9]+)$ ]]; then
@@ -52,6 +62,7 @@ echo "VM index: $VM_INDEX"
 echo "Cores:    $NUM_CORES"
 echo "Flows:    $NUM_FLOWS"
 echo "Experiment Name: $EXP_NAME"
+echo "Perf recording: guest=$PERF_TRACING host=$PERF_HOST_TRACING"
 
 # --- Configuration ---
 GUEST_INTF="enp0s1"
@@ -132,7 +143,7 @@ for z in $run_list; do
   echo "Running $EXP_NAME" "N_RUN=$N_RUNS"
 
   if [ "$DRY_RUN" -eq 1 ]; then
-    "[DRY RUN] Skipping actual experiment"
+    echo "[DRY RUN] Skipping actual experiment"
     continue
   fi
 
@@ -144,7 +155,8 @@ for z in $run_list; do
     -n "$NUM_FLOWS" -c $server_cores_mask \
     --client-home "$CLIENT_HOME" --client-ip "$CLIENT_IP" --client-intf "$CLIENT_INTF" \
     -N "$NUM_FLOWS" -C $client_cores_mask \
-    --host-home "$HOST_HOME" --host-ip "$HOST_IP" \
+    --host-home "$HOST_HOME" --host-ip "$HOST_IP" --host-ssh-name "$HOST_SSH_UNAME" \
+    --perf-tracing "$PERF_TRACING" --perf-host-tracing "$PERF_HOST_TRACING" \
     --client-ssh-name "$CLIENT_SSH_UNAME" --client-ssh-pass "$CLIENT_SSH_PASSWORD" \
     --client-ssh-host "$CLIENT_SSH_HOST" --client-ssh-use-pass "$CLIENT_USE_PASS_AUTH" \
     --client-ssh-ifile "$CLIENT_SSH_IDENTITY_FILE" \
@@ -156,6 +168,7 @@ for z in $run_list; do
   # --- SCP results back to host ---
 	echo "Copying results to host..."
 	local_report_dir="../utils/reports/$EXP_NAME"
+	local_run_dir="${local_report_dir}-RUN-0"
 
 	$SSH_HOST_CMD "mkdir -p ${HOST_RESULTS_DIR}/${EXP_NAME}"
 
@@ -164,6 +177,15 @@ for z in $run_list; do
 	$SCP_HOST_CMD -r \
 		"$local_report_dir"/* \
 		"${HOST_SSH_UNAME}@${HOST_IP}:${HOST_RESULTS_DIR}/${EXP_NAME}/"
+
+	# The stats collector copies only summary metrics. Preserve perf artifacts
+	# from the raw run directory before the host destroys this guest.
+	if [[ "$PERF_TRACING" -eq 1 ]]; then
+		sudo chmod a+r "$local_run_dir"/perf_guest_cpu.{data,stacks} "$local_run_dir/perf_guest_record.log"
+		$SCP_HOST_CMD \
+			"$local_run_dir"/perf_guest_cpu.{data,stacks} "$local_run_dir/perf_guest_record.log" \
+			"${HOST_SSH_UNAME}@${HOST_IP}:${HOST_RESULTS_DIR}/${EXP_NAME}/"
+	fi
 
 	echo "Results copied to ${HOST_SSH_UNAME}@${HOST_IP}:${HOST_RESULTS_DIR}/${EXP_NAME}/"
 
