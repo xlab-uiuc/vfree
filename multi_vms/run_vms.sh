@@ -12,7 +12,7 @@ NUM_ACTIVE_CORES="12"
 NUM_FLOWS="12"
 REUSE=0
 SKIP_RESET_HOST=0
-PERF_TRACING="off" # off/vm0/all; one host recording whenever enabled
+PERF_TRACING="vm0" # off/vm0/all; one host recording whenever enabled
 
 # --- Hardcoded experiment config ---
 GIT_REPO="/home/schai/viommu"
@@ -155,7 +155,7 @@ nested)
 	GUEST_CMD_LINE="$GUEST_CMD_LINE_BASE intel_iommu=on,sm_on iommu.strict=1"
 	;;
 nested-vFree)
-	GUEST_KERNEL="6.12.9-iommufd-nested-iova-contig-cb-opt"
+	GUEST_KERNEL="6.12.9-iommufd-nested-pin-mq"
 	GUEST_KERNEL_PATH="/boot-VM/vmlinuz-$GUEST_KERNEL"
 	GUEST_INITRD_PATH="/boot-VM/initrd.img-$GUEST_KERNEL"
 	GUEST_CMD_LINE="$GUEST_CMD_LINE_BASE intel_iommu=on,sm_on iommu.strict=1 intel_iommu_pinned=on intel_iommu_dfp=on"
@@ -471,7 +471,14 @@ if [[ $REUSE -eq 0 ]]; then
 fi
 
 timestamp=$(date '+%Y-%m-%d-%H-%M-%S')
-EXP_NAME="${timestamp}-$GUEST_KERNEL-MANY-flow${NUM_FLOWS}-${iommu_config}-${NUM_TOTAL_CORES}cores-${NUM_ACTIVE_CORES}active-cores"
+
+if [[ "$VM_SCRIPT" == *tx* ]]; then
+	traffic_dir="TX"
+else
+	traffic_dir="RX"
+fi
+
+EXP_NAME="${timestamp}-$GUEST_KERNEL-MANY-${traffic_direction}-flow${NUM_FLOWS}-${iommu_config}-${NUM_TOTAL_CORES}cores-${NUM_ACTIVE_CORES}active-cores"
 
 echo "============================================================"
 echo "  VM Benchmark Runner"
@@ -615,6 +622,30 @@ if [[ $failed -gt 0 ]]; then
 	cleanup
 	exit 1
 fi
+
+# Reject cloned-interface address collisions before starting any traffic.
+log_info "Checking that guest data NIC MAC addresses are unique..."
+declare -A seen_guest_macs=()
+for ((i = 0; i < NUM_VMS; i++)); do
+	ip=$(vm_ip "$i")
+	if ! mac=$(ssh $SSH_OPTS "$SSH_USER@$ip" "cat /sys/class/net/$GUEST_NIC/address"); then
+		log_error "Could not read ${vm_names[$i]}'s data NIC MAC"
+		cleanup
+		exit 1
+	fi
+	if [[ ! "$mac" =~ ^([[:xdigit:]]{2}:){5}[[:xdigit:]]{2}$ ]]; then
+		log_error "Invalid data NIC MAC from ${vm_names[$i]}: $mac"
+		cleanup
+		exit 1
+	fi
+	if [[ -n "${seen_guest_macs[$mac]:-}" ]]; then
+		log_error "Duplicate data NIC MAC $mac on ${seen_guest_macs[$mac]} and ${vm_names[$i]}"
+		cleanup
+		exit 1
+	fi
+	seen_guest_macs[$mac]="${vm_names[$i]}"
+	echo "  ${vm_names[$i]}: $mac"
+done
 
 # --- Step 11: Sync git repo on all VMs ---
 echo ""

@@ -43,7 +43,18 @@ devlink dev eswitch set "pci/$PF_BDF" mode legacy
 echo "$NUM_VFS" > "$PF_SYSFS/sriov_numvfs"
 echo "Created $NUM_VFS VFs"
 
+pf_netdevs=("$PF_SYSFS"/net/*)
+if [[ ${#pf_netdevs[@]} -ne 1 || ! -e "${pf_netdevs[0]}" ]]; then
+    log_error "Expected one PF network interface for $PF_BDF"
+    exit 1
+fi
+pf_netdev=${pf_netdevs[0]##*/}
+
 for i in $(seq 0 $((NUM_VFS - 1))); do
+    # Give each VF a permanent address before passthrough. Cloned guests can
+    # otherwise derive the same persistent MAC from their shared machine-id.
+    printf -v vf_mac '02:00:00:98:%02x:%02x' "$((i / 256))" "$((i % 256))"
+    ip link set dev "$pf_netdev" vf "$i" mac "$vf_mac"
     vf_bdf=$(basename "$(readlink -f "$PF_SYSFS/virtfn${i}")")
     vf_drv=$(basename "$(readlink -f "/sys/bus/pci/devices/$vf_bdf/driver")" 2>/dev/null || echo "none")
     [[ "$vf_drv" != "none" ]] && echo "$vf_bdf" > "/sys/bus/pci/drivers/$vf_drv/unbind"
@@ -51,5 +62,5 @@ for i in $(seq 0 $((NUM_VFS - 1))); do
     echo "$vf_bdf" > /sys/bus/pci/drivers_probe
     echo "" > "/sys/bus/pci/devices/$vf_bdf/driver_override"
     grp=$(basename "$(readlink -f "/sys/bus/pci/devices/$vf_bdf/iommu_group")")
-    echo "VF $((i+1)): $vf_bdf  iommu_group=$grp"
+    echo "VF $((i+1)): $vf_bdf  mac=$vf_mac  iommu_group=$grp"
 done
