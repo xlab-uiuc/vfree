@@ -29,6 +29,7 @@ fi
 
 # Destroy VFS
 echo 0 > "$PF_SYSFS/sriov_numvfs"
+devlink dev eswitch set "pci/$PF_BDF" mode legacy
 
 # Rebind physical function for passthrough
 # echo "0000:98:00.0" | sudo tee /sys/bus/pci/drivers/mlx5_core/unbind

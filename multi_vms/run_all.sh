@@ -4,15 +4,20 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
-VIOMMU_MODES=("off" "nested-vFree" "nested")
-# VIOMMU_MODES=("nested-vFree")
+# VIOMMU_MODES=("off" "nested-vFree" "nested")
+VIOMMU_MODES=("off")
 
 # --- Experiment configurations ---
 #   (num_vms, num_total_cores, num_active_cores, num_flows)
 #   num_flows = num_active_cores per VM
 CONFIGS=(
+	# "1 32 32 32"
+	"2 16 16 16"
+	# "4 8 8 8"
+	# "8 4 4 4"
+	# "16 2 2 2"
 	# "2 16 16 16"
-	"4 16 16 16"
+	# "4 16 16 16"
 )
 
 run_idx=0
