@@ -15,6 +15,8 @@ FTRACE_BUFFER_SIZE_KB=20000
 FTRACE_OVERWRITE_ON_FULL=0 # 0=no overwrite (tracing stops when full), 1=overwrite
 PERF_TRACING_ENABLED=0
 PERF_TRACING_HOST_ENABLED=0
+TELEMETRY_DIR=""
+TELEMETRY_HELPER=""
 GUEST_PERF="/home/schai/linux-6.12.9/tools/perf/perf"
 
 # --- Base Directory Paths (Relative to respective home directories) ---
@@ -149,7 +151,7 @@ help() {
 SHORT_OPTS="n:c:N:C:e:m:d:b:r:h"
 LONG_OPTS="guest-home:,guest-ip:,guest-intf:,guest-bus:,guest-num:,guest-cpu-mask:,\
 client-home:,client-ip:,client-intf:,client-num:,client-cpu-mask:,\
-host-home:,host-ip:,host-ssh-name:,perf-tracing:,perf-host-tracing:,\
+host-home:,host-ip:,host-ssh-name:,perf-tracing:,perf-host-tracing:,telemetry-dir:,telemetry-helper:,\
 vm-id:,exp-name:,mtu:,ddio:,bandwidth:,ring-buffer:,mlc-cores:,socket-buf:,dur:,runs:,ebpf-tracing:,mem-stats:,\
 client-ssh-name:,client-ssh-host:,client-ssh-use-pass:,client-ssh-pass:,client-ssh-ifile:,help"
 
@@ -179,6 +181,8 @@ while :; do
         --host-ssh-name) HOST_SSH_UNAME="$2"; shift 2 ;;
         --perf-tracing) PERF_TRACING_ENABLED="$2"; shift 2 ;;
         --perf-host-tracing) PERF_TRACING_HOST_ENABLED="$2"; shift 2 ;;
+        --telemetry-dir) TELEMETRY_DIR="$2"; shift 2 ;;
+        --telemetry-helper) TELEMETRY_HELPER="$2"; shift 2 ;;
         --vm-id) VM_ID="$2"; shift 2 ;;
         -e | --exp-name) EXP_NAME="$2"; shift 2 ;;
         -m | --mtu) MTU="$2"; shift 2 ;;
@@ -281,6 +285,17 @@ progress_bar() {
 }
 
 
+# TX receivers listen on this VM's port range; their argv has no guest IP.
+stop_client_receivers() {
+    local port port_pattern=""
+    for ((port = INIT_PORT; port < INIT_PORT + GUEST_NUM_SERVERS; port++)); do
+        port_pattern+="${port_pattern:+|}${port}"
+    done
+    $SSH_CLIENT_CMD \
+        "sudo pkill -TERM -f '^([^[:space:]]*/)?iperf3[[:space:]]+-s[[:space:]]+--port[[:space:]]+(${port_pattern})([[:space:]]|$)'" \
+        2>/dev/null || true
+}
+
 # --- Cleanup Function ---
 cleanup() {
     log_info "--- Starting Cleanup Phase ---"
@@ -314,12 +329,11 @@ cleanup() {
 
     log_info "Terminating client screen sessions: $SCREEN_CLIENT_SESSION, $SCREEN_CLIENT_LOGGING"
     $SSH_CLIENT_CMD \
-      "screen -S $SCREEN_CLIENT_SESSION -X quit" 2>/dev/null || 
+      "screen -S $SCREEN_CLIENT_SESSION -X quit" 2>/dev/null || true
     $SSH_CLIENT_CMD \
 		  "screen -S $SCREEN_CLIENT_LOGGING -X quit" 2>/dev/null || true
 
-	  $SSH_CLIENT_CMD \
-		  "sudo pkill -9 -f 'iperf.*${GUEST_IP}'" 2>/dev/null || true
+    stop_client_receivers
 	  $SSH_CLIENT_CMD \
 		  'screen -wipe' 2>/dev/null || true
 
@@ -461,6 +475,17 @@ cd - > /dev/null
 
 log_info "Warming up experiment (120 seconds)..."
 progress_bar 120 5
+
+# Every VM keeps traffic running while waiting for the common capture window.
+if [[ -n "$TELEMETRY_DIR" ]]; then
+    log_info "Waiting at post-warmup counter recording barrier..."
+    printf -v barrier_command 'python3 %q barrier %q %q' "$TELEMETRY_HELPER" "$TELEMETRY_DIR" "$VM_ID"
+    if ! $SSH_HOST_CMD "$barrier_command"; then
+        log_error "Counter recording barrier failed"
+        cleanup
+        exit 1
+    fi
+fi
 
 # --- Start eBPF Tracers (if enabled) ---
 if [ "$EBPF_TRACING_ENABLED" -eq 1 ]; then

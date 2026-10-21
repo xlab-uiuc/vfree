@@ -1,6 +1,9 @@
 #!/bin/bash
 set -euo pipefail
 
+# Passthrough guests use the system daemon, including in noninteractive SSH.
+export LIBVIRT_DEFAULT_URI="${LIBVIRT_DEFAULT_URI:-qemu:///system}"
+
 # ============================================================
 # Configuration
 # ============================================================
@@ -13,12 +16,21 @@ NUM_FLOWS="12"
 REUSE=0
 SKIP_RESET_HOST=0
 PERF_TRACING="vm0" # off/vm0/all; one host recording whenever enabled
+RECORD_COUNTERS=off # run_all.sh enables this by default
+MEASUREMENT_DURATION=20
+COUNTER_INTERVAL=1
+HOST_PF_BDF="${HOST_PF_BDF:-0000:98:00.0}"
+PCM_IIO_BIN="${PCM_IIO_BIN:-/home/lbalara/viommu/pcm/build/bin/pcm-iio}"
+PCM_IIO_DIR="${PCM_IIO_DIR:-/home/lbalara/viommu/pcm/src}"
+counter_pid=""
+RUN_LABEL=""
+RESULT_FILE=""
+TRAFFIC_DIRECTION="TX"
+vm_names=()
 
 # --- Hardcoded experiment config ---
 GIT_REPO="/home/schai/viommu"
 GIT_BRANCH="multi-cross-numa-tx"
-VM_SCRIPT="cd /home/schai/viommu/scripts/sosp24-experiments; ./many_vm_flows_exp.sh"
-# VM_SCRIPT="cd /home/schai/viommu/scripts/sosp24-experiments; ./many_vm_tx_flows_exp.sh"
 
 # --- Host paths (this script runs ON the host) ---
 HOST_FandS_ABS=$(dirname "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")")
@@ -27,8 +39,8 @@ echo "Host F&S dir: ${HOST_FandS_ABS}"
 
 # --- Host config (auto-inferred, passed to VMs so they can SCP results back) ---
 HOST_IP="192.17.101.97"
-HOST_SSH_UNAME="$(whoami)"
-HOST_HOME="$(eval echo ~$(whoami))"
+HOST_SSH_UNAME="${SUDO_USER:-$(whoami)}"
+HOST_HOME="$(getent passwd "$HOST_SSH_UNAME" | cut -d: -f6)"
 HOST_RESULTS_DIR="${HOST_FandS_ABS}/utils/reports/"
 
 # --- Client machine config ---
@@ -89,6 +101,7 @@ ORIG_DIR="$(pwd)"
 usage() {
 	cat <<-USAGE
 	Usage: $0 [OPTIONS]
+	  --direction DIR    Traffic direction: TX or RX (default: TX)
 	  --viommu MODE       Guest vIOMMU mode: off, nested, nested-vFree (default: $GUEST_VIOMMU)
 	  --num-total-cores N    Total cores per VM
 	  --num-active-cores N   Active cores (iperf instances) per VM
@@ -98,12 +111,21 @@ usage() {
 	  --skip-reset-host   Skip host reset (host setup will still run)
 	  --boot-timeout N    Seconds to wait for SSH per VM (default: $BOOT_TIMEOUT)
 	  --perf-tracing MODE Record host and selected guests: off, vm0, all (default: off)
+	  --record-counters MODE Record NIC/CPU/TCP and host IIO: on or off (default: off)
+	  --duration N       Main measurement duration in seconds (default: 20)
+	  --counter-interval N Counter sampling interval in seconds (default: 1)
+	  --run-label LABEL  Append a repetition label to the experiment name
+	  --result-file PATH Write machine-readable run status for sweep aggregation
 	  -h, --help          Show this help
 	USAGE
 }
 
 while [[ $# -gt 0 ]]; do
 	case "$1" in
+	--direction)
+		[[ $# -ge 2 ]] || { echo "Error: --direction requires TX or RX" >&2; exit 2; }
+		TRAFFIC_DIRECTION="$2"; shift 2 ;;
+	--direction=*) TRAFFIC_DIRECTION="${1#*=}"; shift ;;
 	--viommu)        GUEST_VIOMMU="$2"; shift 2 ;;
 	--num-vms)       NUM_VMS="$2";      shift 2 ;;
 	--num-total-cores)  NUM_TOTAL_CORES="$2";  shift 2 ;;
@@ -113,15 +135,42 @@ while [[ $# -gt 0 ]]; do
 	--skip-reset-host)  SKIP_RESET_HOST=1; shift   ;;
 	--boot-timeout)  BOOT_TIMEOUT="$2"; shift 2 ;;
 	--perf-tracing)  PERF_TRACING="$2"; shift 2 ;;
+	--record-counters) RECORD_COUNTERS="$2"; shift 2 ;;
+	--duration) MEASUREMENT_DURATION="$2"; shift 2 ;;
+	--counter-interval) COUNTER_INTERVAL="$2"; shift 2 ;;
+	--run-label) RUN_LABEL="$2"; shift 2 ;;
+	--result-file) RESULT_FILE="$2"; shift 2 ;;
 	-h|--help)       usage; exit 0      ;;
 	*)               echo "Error: unknown option '$1'" >&2; usage >&2; exit 1 ;;
 	esac
 done
 
+# Select the guest workload before any VM or host setup happens.
+traffic_direction="${TRAFFIC_DIRECTION^^}"
+case "$traffic_direction" in
+TX) VM_SCRIPT="cd ${GIT_REPO}/scripts/sosp24-experiments; ./many_vm_tx_flows_exp.sh" ;;
+RX) VM_SCRIPT="cd ${GIT_REPO}/scripts/sosp24-experiments; ./many_vm_flows_exp.sh" ;;
+*) echo "Error: --direction must be TX or RX" >&2; exit 2 ;;
+esac
+
 case "$PERF_TRACING" in
 off|vm0|all) ;;
 *) echo "Error: --perf-tracing must be off, vm0, or all" >&2; exit 1 ;;
 esac
+
+case "$RECORD_COUNTERS" in
+on|off) ;;
+*) echo "Error: --record-counters must be on or off" >&2; exit 1 ;;
+esac
+if [[ -n "$RUN_LABEL" && ! "$RUN_LABEL" =~ ^[[:alnum:]_.-]+$ ]]; then
+	echo "Error: --run-label must contain only letters, digits, dots, underscores, or hyphens" >&2
+	exit 1
+fi
+# The existing shell runners require an integer measurement duration.
+if [[ ! "$MEASUREMENT_DURATION" =~ ^[1-9][0-9]*$ || ! "$COUNTER_INTERVAL" =~ ^[1-9][0-9]*$ ]]; then
+	echo "Error: --duration and --counter-interval must be positive integers" >&2
+	exit 1
+fi
 
 if [[ -z "$NUM_TOTAL_CORES" || -z "$NUM_FLOWS" || -z "$NUM_VMS" || -z "$NUM_ACTIVE_CORES" ]]; then
 	echo "Error: --num-total-cores, --num-active-cores, --num-flows, and --num-vms are required" >&2
@@ -165,6 +214,8 @@ nested-vFree)
 	exit 1
 	;;
 esac
+
+HOST_KERNEL="$(uname -r)"
 
 # --- Host-side in-tree modules to push into guests ---
 HOST_MLX5_CORE="/lib/modules/$GUEST_KERNEL/kernel/drivers/net/ethernet/mellanox/mlx5/core/mlx5_core.ko"
@@ -403,8 +454,71 @@ setup_host() {
 	log_info "Host setup complete"
 }
 
+# Own only the recorder created for this run. Its children have bounded lifetimes.
+stop_counter_recorder() {
+	if [[ -n "$counter_pid" ]]; then
+		kill "$counter_pid" 2>/dev/null || true
+		wait "$counter_pid" 2>/dev/null || true
+		counter_pid=""
+	fi
+}
+finish_run() {
+	local run_rc=$?
+	trap - EXIT
+	stop_counter_recorder
+	if [[ -n "$RESULT_FILE" ]]; then
+		if ! python3 - "$RESULT_FILE" "$run_rc" "$EXP_NAME" "$HOST_RESULTS_DIR" \
+			"$GUEST_VIOMMU" "$NUM_VMS" "$NUM_TOTAL_CORES" "$NUM_ACTIVE_CORES" "$NUM_FLOWS" \
+			"$MEASUREMENT_DURATION" "$COUNTER_INTERVAL" "$RECORD_COUNTERS" "$PERF_TRACING" \
+			"$RUN_LABEL" "${traffic_direction:-unknown}" "$GUEST_KERNEL" "$ORIG_DIR" "${vm_names[@]}" <<'RESULT'
+import json
+import platform
+from pathlib import Path
+import shutil
+import sys
+
+(destination, rc, experiment, reports, viommu, num_vms, total, active, flows,
+ duration, interval, counters, perf, label, direction, guest_kernel, log_directory, *vm_names) = sys.argv[1:]
+report = (Path(reports) / experiment).resolve() if experiment else None
+result = dict(schema_version=1, status='complete' if int(rc) == 0 else 'failed',
+              exit_code=int(rc), experiment=experiment, report_directory=str(report) if report else None,
+              run_label=label, vm_names=vm_names,
+              configuration=dict(viommu=viommu, num_vms=int(num_vms), total_cores=int(total),
+                                 active_cores=int(active), flows=int(flows), direction=direction,
+                                 duration_s=int(duration), interval_s=int(interval),
+                                 record_counters=counters, perf_tracing=perf, host_kernel=platform.release(),
+                                 guest_kernel=guest_kernel))
+if report:
+    report.mkdir(parents=True, exist_ok=True)
+    for name in vm_names:
+        source = Path(log_directory) / (name + '_experiment.log')
+        if source.exists() and experiment in source.read_text(errors='replace'):
+            shutil.copy2(source, report / ('host-' + name + '_experiment.log'))
+path = Path(destination).resolve()
+path.parent.mkdir(parents=True, exist_ok=True)
+temporary = path.with_name(path.name + '.tmp')
+temporary.write_text(json.dumps(result, indent=2) + '\n')
+temporary.replace(path)
+RESULT
+		then
+			log_error "Failed to write run result: $RESULT_FILE"
+			[[ "$run_rc" -ne 0 ]] || run_rc=1
+		fi
+	fi
+	exit "$run_rc"
+}
+trap finish_run EXIT
+
+append_counter_summary() {
+	if [[ "$RECORD_COUNTERS" == on && -f "$TELEMETRY_DIR/manifest.json" ]]; then
+		python3 "$TELEMETRY_HELPER" summary "$TELEMETRY_DIR" \
+			| tee -a "${HOST_RESULTS_DIR%/}/${EXP_NAME}/summary.txt"
+	fi
+}
+
 # --- Cleanup (post-experiment) ---
 cleanup() {
+	stop_counter_recorder
 	echo ""
 	log_info "=== Cleanup ==="
 
@@ -471,14 +585,10 @@ if [[ $REUSE -eq 0 ]]; then
 fi
 
 timestamp=$(date '+%Y-%m-%d-%H-%M-%S')
-
-if [[ "$VM_SCRIPT" == *tx* ]]; then
-	traffic_dir="TX"
-else
-	traffic_dir="RX"
+EXP_NAME="${timestamp}-HOST-$HOST_KERNEL-GUEST-$GUEST_KERNEL-MANY-${traffic_direction}-flow${NUM_FLOWS}-${iommu_config}-${NUM_TOTAL_CORES}cores-${NUM_ACTIVE_CORES}active-cores"
+if [[ -n "$RUN_LABEL" ]]; then
+	EXP_NAME+="-${RUN_LABEL}"
 fi
-
-EXP_NAME="${timestamp}-$GUEST_KERNEL-MANY-${traffic_direction}-flow${NUM_FLOWS}-${iommu_config}-${NUM_TOTAL_CORES}cores-${NUM_ACTIVE_CORES}active-cores"
 
 echo "============================================================"
 echo "  VM Benchmark Runner"
@@ -674,6 +784,51 @@ if ! setup_host; then
 	exit 1
 fi
 
+# Guest runners and wrappers come from the Git sync in Step 11.
+TELEMETRY_DIR=""
+TELEMETRY_HELPER="${HOST_FandS_ABS}/multi_vms/record_sweep.py"
+if [[ "$RECORD_COUNTERS" == on ]]; then
+	pf_interfaces=(/sys/bus/pci/devices/"$HOST_PF_BDF"/net/*)
+	if [[ ${#pf_interfaces[@]} -ne 1 || ! -e "${pf_interfaces[0]}" ]]; then
+		log_error "Expected one host PF interface for $HOST_PF_BDF"
+		cleanup
+		exit 1
+	fi
+	TELEMETRY_DIR="${HOST_RESULTS_DIR%/}/${EXP_NAME}/counters"
+	mkdir -p "$TELEMETRY_DIR"
+	# Guest-to-host barrier SSH uses the invoking user's account, also under sudo.
+	if [[ $EUID -eq 0 ]]; then
+		chown "$HOST_SSH_UNAME" "$TELEMETRY_DIR"
+	fi
+	python3 "$TELEMETRY_HELPER" coordinate \
+		--output "$TELEMETRY_DIR" --experiment "$EXP_NAME" --direction "$traffic_direction" \
+		--viommu "$GUEST_VIOMMU" --num-vms "$NUM_VMS" --total-cores "$NUM_TOTAL_CORES" \
+		--active-cores "$NUM_ACTIVE_CORES" --flows "$NUM_FLOWS" \
+		--duration "$MEASUREMENT_DURATION" --interval "$COUNTER_INTERVAL" \
+		--host-interface "${pf_interfaces[0]##*/}" \
+		--peer-interface "$CLIENT_INTF" --peer-ip "$CLIENT_IP" --peer-ssh "$SSH_CLIENT_CMD" \
+		--guest-interface "$GUEST_NIC" --guest-ssh "ssh $SSH_OPTS" \
+		--guest-user "$SSH_USER" --guest-ip-base "$IP_BASE" --guest-data-ip-base "192.168.101.11" \
+		--pcm-bin "$PCM_IIO_BIN" --pcm-dir "$PCM_IIO_DIR" \
+		>"$TELEMETRY_DIR/coordinator.log" 2>&1 &
+	counter_pid=$!
+	for ((attempt = 0; attempt < 120; attempt++)); do
+		[[ -f "$TELEMETRY_DIR/armed.json" ]] && break
+		if ! kill -0 "$counter_pid" 2>/dev/null; then
+			log_error "Counter preflight failed: $TELEMETRY_DIR/coordinator.log"
+			cleanup
+			exit 1
+		fi
+		sleep 1
+	done
+	if [[ ! -f "$TELEMETRY_DIR/armed.json" ]]; then
+		log_error "Counter preflight timed out: $TELEMETRY_DIR/coordinator.log"
+		cleanup
+		exit 1
+	fi
+	log_info "Counter recording armed: $TELEMETRY_DIR"
+fi
+
 # --- Step 13: Run experiment on all VMs simultaneously ---
 echo ""
 log_info "Step 13: Launching experiments on all VMs..."
@@ -704,7 +859,11 @@ for ((i = 0; i < NUM_VMS; i++)); do
 		--exp-name ${EXP_NAME}-${name} \
 		--host-ip ${HOST_IP} --host-ssh-uname ${HOST_SSH_UNAME} \
 		--host-home ${HOST_HOME} --host-results-dir ${HOST_RESULTS_DIR} \
-		--perf-tracing ${perf_guest} --perf-host-tracing ${perf_host}"
+		--perf-tracing ${perf_guest} --perf-host-tracing ${perf_host} --duration ${MEASUREMENT_DURATION}"
+	if [[ "$RECORD_COUNTERS" == on ]]; then
+		printf -v counter_args ' --telemetry-dir %q --telemetry-helper %q' "$TELEMETRY_DIR" "$TELEMETRY_HELPER"
+		vm_cmd+="$counter_args"
+	fi
 	ssh $SSH_OPTS "$SSH_USER@$ip" "$vm_cmd" &>"${name}_experiment.log" &
 	ssh_pids+=($!)
 	echo "  Launched on ${name} (${ip}), log -> ${name}_experiment.log"
@@ -726,12 +885,22 @@ for ((i = 0; i < NUM_VMS; i++)); do
 	fi
 done
 
+# Preserve partial evidence and report counter failures before destroying guests.
+if [[ -n "$counter_pid" ]]; then
+	if ! wait "$counter_pid"; then
+		log_error "Counter recording FAILED; see $TELEMETRY_DIR/coordinator.log"
+		any_failed=true
+	fi
+	counter_pid=""
+fi
+
 # --- Step 14: Cleanup ---
 echo ""
 log_info "Step 14: Cleanup..."
 cleanup
 
 if [[ "$any_failed" == true ]]; then
+	append_counter_summary
 	echo ""
 	log_info "=== Experiment finished with ERRORS (check *_experiment.log files) ==="
 	exit 1
@@ -745,8 +914,14 @@ SUMMARY_DIR="${HOST_RESULTS_DIR}/${EXP_NAME}"
 
 mkdir -p "$SUMMARY_DIR"
 cd "${HOST_FandS_ABS}/scripts" || true
-python3 "$REPORT_SCRIPT" "$EXP_NAME" tput,cpu "$NUM_VMS" | tee "$SUMMARY_DIR/summary.txt"
+report_rc=0
+python3 "$REPORT_SCRIPT" "$EXP_NAME" tput,cpu "$NUM_VMS" | tee "$SUMMARY_DIR/summary.txt" || report_rc=$?
+append_counter_summary
 cd "$ORIG_DIR"
+if [[ "$report_rc" -ne 0 ]]; then
+	log_error "Throughput report failed (exit $report_rc); counter summary retained"
+	exit "$report_rc"
+fi
 
 log_info "=== Experiment finished successfully ==="
 exit 0

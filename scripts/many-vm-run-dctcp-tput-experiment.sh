@@ -15,6 +15,8 @@ FTRACE_BUFFER_SIZE_KB=20000
 FTRACE_OVERWRITE_ON_FULL=0 # 0=no overwrite (tracing stops when full), 1=overwrite
 PERF_TRACING_ENABLED=0
 PERF_TRACING_HOST_ENABLED=0
+TELEMETRY_DIR=""
+TELEMETRY_HELPER=""
 
 # --- Base Directory Paths (Relative to respective home directories) ---
 SCRIPT_DIR=$(dirname "$0")
@@ -145,7 +147,7 @@ help() {
 SHORT_OPTS="n:c:N:C:e:m:d:b:r:h"
 LONG_OPTS="guest-home:,guest-ip:,guest-intf:,guest-bus:,guest-num:,guest-cpu-mask:,\
 client-home:,client-ip:,client-intf:,client-num:,client-cpu-mask:,\
-host-home:,host-ip:,host-ssh-name:,perf-tracing:,perf-host-tracing:,\
+host-home:,host-ip:,host-ssh-name:,perf-tracing:,perf-host-tracing:,telemetry-dir:,telemetry-helper:,\
 vm-id:,exp-name:,mtu:,ddio:,bandwidth:,ring-buffer:,mlc-cores:,socket-buf:,dur:,runs:,ebpf-tracing:,mem-stats:,\
 client-ssh-name:,client-ssh-host:,client-ssh-use-pass:,client-ssh-pass:,client-ssh-ifile:,help"
 
@@ -174,6 +176,8 @@ while :; do
 	--host-ssh-name) HOST_SSH_UNAME="$2"; shift 2 ;;
 	--perf-tracing) PERF_TRACING_ENABLED="$2"; shift 2 ;;
 	--perf-host-tracing) PERF_TRACING_HOST_ENABLED="$2"; shift 2 ;;
+	--telemetry-dir) TELEMETRY_DIR="$2"; shift 2 ;;
+	--telemetry-helper) TELEMETRY_HELPER="$2"; shift 2 ;;
 	--vm-id) VM_ID="$2"; shift 2 ;;
 	-e | --exp-name) EXP_NAME="$2"; shift 2 ;;
 	-m | --mtu) MTU="$2"; shift 2 ;;
@@ -508,6 +512,17 @@ $SSH_CLIENT_CMD "screen -dmS $SCREEN_CLIENT_SESSION sudo bash -c \"$client_cmd\"
 # --- Warmup Phase ---
 log_info "Warming up experiment (120 seconds)..."
 progress_bar 120 2
+
+# Every VM keeps traffic running while waiting for the common capture window.
+if [[ -n "$TELEMETRY_DIR" ]]; then
+    log_info "Waiting at post-warmup counter recording barrier..."
+    printf -v barrier_command 'python3 %q barrier %q %q' "$TELEMETRY_HELPER" "$TELEMETRY_DIR" "$VM_ID"
+    if ! $SSH_HOST_CMD "$barrier_command"; then
+        log_error "Counter recording barrier failed"
+        cleanup
+        exit 1
+    fi
+fi
 
 if [ "$EBPF_TRACING_HOST_ENABLED" -eq 1 ]; then
     log_info "Starting HOST eBPF tracer on $HOST_IP..."

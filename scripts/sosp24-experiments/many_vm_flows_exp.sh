@@ -18,6 +18,9 @@ HOST_HOME_ARG=""
 HOST_RESULTS_DIR_ARG=""
 PERF_TRACING=0
 PERF_HOST_TRACING=0
+TELEMETRY_DIR=""
+TELEMETRY_HELPER=""
+MEASUREMENT_DURATION=20
 
 while [[ $# -gt 0 ]]; do
 	case "$1" in
@@ -31,6 +34,9 @@ while [[ $# -gt 0 ]]; do
 	--host-results-dir) HOST_RESULTS_DIR_ARG="$2"; shift 2 ;;
 	--perf-tracing)     PERF_TRACING="$2";         shift 2 ;;
 	--perf-host-tracing) PERF_HOST_TRACING="$2";   shift 2 ;;
+	--telemetry-dir) TELEMETRY_DIR="$2"; shift 2 ;;
+	--telemetry-helper) TELEMETRY_HELPER="$2"; shift 2 ;;
+	--duration) MEASUREMENT_DURATION="$2"; shift 2 ;;
 	--dry)              DRY_RUN=1;                 shift   ;;
 	*)                  shift                      ;;
 	esac
@@ -162,6 +168,7 @@ for z in $run_list; do
 		-N "$NUM_FLOWS" -C "$client_cores_mask" \
 		--host-home "$HOST_HOME" --host-ip "$HOST_IP" --host-ssh-name "$HOST_SSH_UNAME" \
 		--perf-tracing "$PERF_TRACING" --perf-host-tracing "$PERF_HOST_TRACING" \
+		--telemetry-dir "$TELEMETRY_DIR" --telemetry-helper "$TELEMETRY_HELPER" --dur "$MEASUREMENT_DURATION" \
 		--client-ssh-name "$CLIENT_SSH_UNAME" --client-ssh-pass "$CLIENT_SSH_PASSWORD" \
 		--client-ssh-host "$CLIENT_SSH_HOST" --client-ssh-use-pass "$CLIENT_USE_PASS_AUTH" \
 		--client-ssh-ifile "$CLIENT_SSH_IDENTITY_FILE" \
