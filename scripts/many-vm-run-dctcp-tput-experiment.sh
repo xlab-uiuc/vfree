@@ -513,11 +513,26 @@ $SSH_CLIENT_CMD "screen -dmS $SCREEN_CLIENT_SESSION sudo bash -c \"$client_cmd\"
 log_info "Warming up experiment (120 seconds)..."
 progress_bar 120 2
 
+# SSH may reject a burst of guest connections at MaxStartups. The host barrier
+# is idempotent, so transport failures can be retried without releasing it early.
+wait_for_counter_barrier() {
+    local barrier_command attempt rc
+    printf -v barrier_command 'python3 %q barrier %q %q' "$TELEMETRY_HELPER" "$TELEMETRY_DIR" "$VM_ID"
+    for ((attempt = 1; attempt <= 8; attempt++)); do
+        rc=0
+        $SSH_HOST_CMD -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=2 "$barrier_command" || rc=$?
+        [[ $rc -eq 0 ]] && return 0
+        # Exit 255 is an SSH transport failure; coordinator errors must propagate.
+        [[ $rc -eq 255 && $attempt -lt 8 ]] || return "$rc"
+        log_info "Barrier SSH connection failed; retry ${attempt}/8..."
+        sleep "$((attempt + VM_ID % 3))"
+    done
+}
+
 # Every VM keeps traffic running while waiting for the common capture window.
 if [[ -n "$TELEMETRY_DIR" ]]; then
     log_info "Waiting at post-warmup counter recording barrier..."
-    printf -v barrier_command 'python3 %q barrier %q %q' "$TELEMETRY_HELPER" "$TELEMETRY_DIR" "$VM_ID"
-    if ! $SSH_HOST_CMD "$barrier_command"; then
+    if ! wait_for_counter_barrier; then
         log_error "Counter recording barrier failed"
         cleanup
         exit 1
