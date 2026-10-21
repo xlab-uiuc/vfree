@@ -99,6 +99,8 @@ echo "Guest IP: $GUEST_IP"
 
 # --- Helper functions ---
 
+source "$SCRIPT_DIR/../multi-vm-ssh.sh"
+
 if [ "$CLIENT_USE_PASS_AUTH" -eq 1 ]; then
 	SSH_CLIENT_CMD="sshpass -p $CLIENT_SSH_PASSWORD ssh ${CLIENT_SSH_UNAME}@${CLIENT_SSH_HOST}"
 else
