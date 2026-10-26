@@ -312,8 +312,6 @@ pre_exp_setup() {
 cleanup() {
     local pid
     for pid in "${traffic_pids[@]}"; do kill "$pid" 2>/dev/null || true; done
-    for pid in "${traffic_pids[@]}"; do wait "$pid" 2>/dev/null || true; done
-    traffic_pids=()
 	log_info "--- Starting Cleanup Phase ---"
 
 	log_info "Killing local 'loaded_latency', 'iperf' processes..."
@@ -363,6 +361,11 @@ cleanup() {
 		"sudo pkill -9 -f 'iperf.*${GUEST_IP}'" 2>/dev/null || true
 	$SSH_CLIENT_CMD \
 		'screen -wipe' 2>/dev/null || true
+
+    # Stop the local and remote flows before waiting for their launchers.
+    # sudo may defer termination while its command is still running.
+    for pid in "${traffic_pids[@]}"; do wait "$pid" 2>/dev/null || true; done
+    traffic_pids=()
 
 	log_info "Resetting GUEST network interface $GUEST_INTF..."
 	sudo ip link set "$GUEST_INTF" down

@@ -301,8 +301,6 @@ stop_client_receivers() {
 cleanup() {
     local pid
     for pid in "${traffic_pids[@]}"; do kill "$pid" 2>/dev/null || true; done
-    for pid in "${traffic_pids[@]}"; do wait "$pid" 2>/dev/null || true; done
-    traffic_pids=()
     log_info "--- Starting Cleanup Phase ---"
 
     log_info "Killing local 'loaded_latency', 'iperf', and 'perf record' processes..."
@@ -341,6 +339,11 @@ cleanup() {
     stop_client_receivers
 	  $SSH_CLIENT_CMD \
 		  'screen -wipe' 2>/dev/null || true
+
+    # Stop the local and remote flows before waiting for their launchers.
+    # sudo may defer termination while its command is still running.
+    for pid in "${traffic_pids[@]}"; do wait "$pid" 2>/dev/null || true; done
+    traffic_pids=()
 
         sudo echo 0 > /sys/kernel/debug/tracing/tracing_on
     sudo echo 0 > /sys/kernel/debug/tracing/options/overwrite
