@@ -489,6 +489,7 @@ trap finish_run EXIT
 trap 'exit 129' HUP
 trap 'exit 130' INT
 trap 'exit 143' TERM
+trap 'exit 141' PIPE
 
 append_counter_summary() {
 	if [[ "$RECORD_COUNTERS" == on && -f "$TELEMETRY_DIR/manifest.json" ]]; then

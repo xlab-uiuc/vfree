@@ -6,7 +6,7 @@ cd "$SCRIPT_DIR"
 
 VIOMMU_MODES=("off" "vFree-dlf" "nested" "vFree-pin")
 # VIOMMU_MODES=("off")
-TRAFFIC_DIRECTION="RX"
+TRAFFIC_DIRECTION="${TRAFFIC_DIRECTION:-RX}"
 NUM_RUNS=1
 
 # --- Experiment configurations ---
