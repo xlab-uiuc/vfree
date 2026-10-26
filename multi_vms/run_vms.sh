@@ -32,7 +32,7 @@ vm_names=()
 
 # --- Hardcoded experiment config ---
 GIT_REPO="/home/schai/viommu"
-GIT_BRANCH="multi-cross-numa-tx"
+GIT_BRANCH="multi-core-exp"
 
 # --- Host paths (this script runs ON the host) ---
 HOST_FandS_ABS=$(dirname "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")")
