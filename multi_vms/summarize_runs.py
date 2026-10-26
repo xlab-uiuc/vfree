@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Aggregate independent launcher repetitions, never pooling VMs or PCM samples."""
+"""Aggregate independent launcher runs, never pooling VMs or PCM samples."""
 import argparse
 import csv
 import json
 import math
 from pathlib import Path
 import statistics
+import sys
 
 from record_sweep import atomic_json, iio_mean_rates
 
@@ -52,7 +53,6 @@ def run_metrics(result):
     if any(manifest[key] != config[key] for key in ('direction', 'viommu', 'num_vms',
                                                    'total_cores', 'active_cores', 'flows', 'duration_s', 'interval_s')):
         raise ValueError('counter recording configuration mismatch')
-    received = {}
     for name in ['host', 'peer'] + [f'vm{i}' for i in range(config['num_vms'])]:
         evidence = json.loads((counters / (name + '.json')).read_text())
         if evidence['errors']:
@@ -61,9 +61,6 @@ def run_metrics(result):
         elapsed = finite(summary['elapsed_s'])
         if elapsed <= 0:
             raise ValueError('invalid capture duration')
-        cpu = summary['cpu_busy_pct'].get('cpu')
-        if cpu is not None:
-            metrics[name + '.cpu_busy_pct'] = finite(cpu)
         for group, keys in (
             ('ethtool', ('rx_discards_phy', 'rx_out_of_buffer', 'rx_prio0_buf_discard',
                          'rx_pause_ctrl_phy', 'tx_pause_ctrl_phy', 'rx_pause_duration_phy', 'tx_pause_duration_phy')),
@@ -76,17 +73,6 @@ def run_metrics(result):
             for key in keys:
                 if key in summary['delta'][group]:
                     metrics[f'{name}.{key}.gbps'] = finite(summary['delta'][group][key]) * 8 / elapsed / 1e9
-        if evidence['metadata']['peers']:
-            tcp = summary['tcp']
-            for key, value in tcp['gbps'].items():
-                metrics[f'{name}.tcp.{key}.gbps'] = finite(value)
-            metrics[name + '.tcp.bytes_retrans.delta'] = finite(tcp['delta']['bytes_retrans'])
-            metrics[name + '.tcp.stable_sockets'] = tcp['stable_socket_count']
-            metrics[name + '.tcp.opened_sockets'] = len(tcp['opened'])
-            metrics[name + '.tcp.closed_sockets'] = len(tcp['closed'])
-            received[name] = finite(tcp['gbps']['bytes_received'])
-    receivers = [f'vm{i}' for i in range(config['num_vms'])] if config['direction'] == 'RX' else ['peer']
-    metrics['throughput.counter_window_gbps'] = sum(received[name] for name in receivers)
     means = iio_mean_rates(counters / 'iio.csv')
     if not any('IOMMU' in field for values in means.values() for field in values):
         raise ValueError('no IOMMU samples')
@@ -102,7 +88,7 @@ def aggregate(directory, expected_runs):
     configuration = None
     seen = set()
     for repetition in range(1, expected_runs + 1):
-        path = directory / f'rep-{repetition:03d}'
+        path = directory / f'run-{repetition:02d}'
         record = dict(repetition=repetition, status='pending', directory=str(path))
         records.append(record)
         if not path.exists():
@@ -119,16 +105,23 @@ def aggregate(directory, expected_runs):
                 raise ValueError('missing experiment identity')
             identity = str(Path(result['report_directory']).resolve())
             if identity in seen:
-                raise ValueError('report directory reused by another repetition')
+                raise ValueError('report directory reused by another run')
             seen.add(identity)
             values = run_metrics(result)
             if configuration is not None and result['configuration'] != configuration:
-                raise ValueError('configuration differs from other successful repetitions')
+                raise ValueError('configuration differs from other successful runs')
             configuration = result['configuration']
             record.update(status='complete', metrics=values)
         except (OSError, ValueError, KeyError, TypeError, ZeroDivisionError) as exc:
             record.update(status='failed', error=str(exc))
-    good = [record for record in records if record['status'] == 'complete']
+    incomplete = [record for record in records if record['status'] != 'complete']
+    if incomplete:
+        for name in ('summary.json', 'summary.txt', 'summary-details.txt', 'runs.csv'):
+            (directory / name).unlink(missing_ok=True)
+        errors = '; '.join(f"Run {record['repetition']:02d}: {record.get('error', 'not started')}"
+                           for record in incomplete)
+        raise ValueError(f'{directory}: {errors}')
+    good = records
     keys = sorted({key for record in good for key in record['metrics']})
     metrics = {}
     for key in keys:
@@ -142,18 +135,18 @@ def aggregate(directory, expected_runs):
     atomic_json(directory / 'summary.json', summary)
     with (directory / 'runs.csv').open('w', newline='') as stream:
         writer = csv.writer(stream)
-        writer.writerow(['repetition', 'status', 'experiment', 'report_directory', 'error'] + keys)
+        writer.writerow(['run', 'status', 'experiment', 'report_directory', 'error'] + keys)
         for record in records:
             writer.writerow([record['repetition'], record['status'], record.get('experiment', ''),
                              record.get('report_directory', ''), record.get('error', '')] +
                             [record.get('metrics', {}).get(key, '') for key in keys])
     lines = ['======= Repeated configuration: ' + directory.name + ' =======',
              f"Runs: {len(good)}/{expected_runs} successful; {summary['failed_runs']} failed; {summary['pending_runs']} pending",
-             'Statistics are across independent repetitions; stddev uses n - 1 (N/A for fewer than two).']
+             'Statistics are across independent runs; stddev uses n - 1 (N/A for fewer than two).']
     if configuration:
         lines.append('Configuration: ' + json.dumps(configuration, sort_keys=True))
     for record in records:
-        lines.append(f"  Rep {record['repetition']}: {record['status']} " +
+        lines.append(f"  Run {record['repetition']:02d}: {record['status']} " +
                      (record.get('report_directory') or record.get('error') or 'not started'))
         if record['status'] == 'failed' and record.get('report_directory'):
             lines.append('    ' + record['error'])
@@ -169,7 +162,6 @@ def aggregate(directory, expected_runs):
         lines.append(f"{key:<75} {values['mean']:>16.6f} {stddev:>16} {values['n']:>5}")
     if locations:
         lines.append('IIO: text shows four busiest locations; summary.json and runs.csv include all locations.')
-    lines.append('Failed or incomplete repetitions are excluded; missing metrics are not replaced with zero.')
     (directory / 'summary-details.txt').write_text('\n'.join(lines) + '\n')
     text = throughput_summary(summary, directory.name)
     (directory / 'summary.txt').write_text(text)
@@ -187,7 +179,7 @@ def throughput_summary(summary, name):
                      f"{config['active_cores']} active/VM | {config['flows']} flows/VM")
     lines += [f"Runs: {summary['successful_runs']}/{summary['expected_runs']} successful; "
               f"{summary['failed_runs']} failed; {summary['pending_runs']} pending",
-              'Means and sample stddevs are across repetitions (n - 1; N/A for one run).']
+              'Means and sample stddevs are across runs (n - 1; N/A for one run).']
 
     def table(title, rows):
         lines.extend(['', title, f"{'Measurement':<44} {'Mean':>12} {'Stddev':>12} {'n':>5}"])
@@ -199,31 +191,81 @@ def throughput_summary(summary, name):
                 stddev = f"{values['stddev']:.4f}" if values['stddev'] is not None else 'N/A'
                 lines.append(f"{label:<44} {values['mean']:>12.4f} {stddev:>12} {values['n']:>5}")
 
-    aggregate_rows = [('Total: sum of VM iperf throughput', 'throughput.total_gbps')]
-    if 'throughput.counter_window_gbps' in metrics:
-        aggregate_rows.append(('Total: TCP receive over counter window', 'throughput.counter_window_gbps'))
+    synchronized = bool(config and config.get('measurement_basis') == 'synchronized-iperf')
+    aggregate_rows = [('Total: iperf during measurement window' if synchronized else
+                       'Total: legacy early iperf (30-60 s)', 'throughput.total_gbps')]
     table('Aggregate throughput (Gbit/s)', aggregate_rows)
     vm_keys = sorted((key for key in metrics if key.startswith('vm') and key.endswith('.throughput_gbps')),
                      key=lambda key: int(key.split('.')[0][2:]))
-    table('Per-VM throughput (iperf, Gbit/s)',
+    table('Per-VM throughput ('+('synchronized window' if synchronized else 'legacy early iperf')+', Gbit/s)',
           [(key.split('.')[0].upper(), key) for key in vm_keys] +
           [('Mean across VMs in each run', 'throughput.vm_mean_gbps')])
-    if 'throughput.counter_window_gbps' in metrics:
-        lines += ['', 'Iperf and TCP counter totals use different measurement windows.']
-    for record in summary['runs']:
-        if record['status'] != 'complete':
-            lines.append(f"Rep {record['repetition']}: {record['status']}: " + record.get('error', 'not started'))
     lines += ['', 'Detailed NIC/CPU/TCP/IOMMU statistics and run paths: summary-details.txt',
-              'All metrics: summary.json | Per-repetition values: runs.csv']
+              'All metrics: summary.json | Per-run values: runs.csv']
     return '\n'.join(lines) + '\n'
+
+
+
+def sweep_summary(directory, run_name):
+    """Summarize the already-written config/mode summaries without pooling runs."""
+    directory = Path(directory).resolve()
+    for suffix in ('csv', 'txt'):
+        (directory / ('summary-' + run_name + '.' + suffix)).unlink(missing_ok=True)
+    rows = []
+    for config_directory in directory.glob('*/' + run_name):
+        path = config_directory / 'summary.json'
+        summary = json.loads(path.read_text())
+        if (summary['successful_runs'] != summary['expected_runs'] or
+                summary['failed_runs'] or summary['pending_runs']):
+            raise ValueError(f'{config_directory}: not all runs completed successfully')
+        config = summary['configuration']
+        throughput = summary['metrics'].get('throughput.total_gbps', {})
+        cpu = summary['metrics'].get('cpu.guest_mean_pct', {})
+        rows.append(dict(num_vms=config.get('num_vms'), cores_per_vm=config.get('total_cores'),
+            active_cores_per_vm=config.get('active_cores'), flows_per_vm=config.get('flows'),
+            viommu=config.get('viommu', path.parent.name), direction=config.get('direction'),
+            mean_gbps=throughput.get('mean'), stddev_gbps=throughput.get('stddev'),
+            mean_guest_cpu_pct=cpu.get('mean'), successful_runs=summary['successful_runs'],
+            failed_runs=summary['failed_runs'], pending_runs=summary['pending_runs'],
+            summary=str(path.parent.relative_to(directory)/'summary.txt')))
+    if not rows:
+        raise ValueError(f'No configuration summaries found for {run_name}')
+    order={'off':0,'vFree-dlf':1,'nested':2,'vFree-pin':3}
+    rows.sort(key=lambda row:(row['num_vms'] or 0, order.get(row['viommu'],4),row['viommu']))
+    fields=['num_vms','cores_per_vm','active_cores_per_vm','flows_per_vm','viommu','direction',
+            'mean_gbps','stddev_gbps','mean_guest_cpu_pct','successful_runs','failed_runs',
+            'pending_runs','summary']
+    with (directory/('summary-'+run_name+'.csv')).open('w',newline='') as stream:
+        writer=csv.DictWriter(stream,fieldnames=fields)
+        writer.writeheader()
+        writer.writerows(rows)
+    lines=['Run: '+run_name,
+           'Throughput: aggregate iperf Gbit/s. Means/stddevs are across runs.', '',
+           f"{'VMs':>4} {'Cores/VM':>8} {'Flows/VM':>8} {'vIOMMU':<12} {'Mean':>10} {'Stddev':>10} {'CPU %':>8} {'n':>3} {'Failed':>6}"]
+    def number(value):
+        return 'N/A' if value is None else f'{value:.3f}'
+    for row in rows:
+        lines.append(f"{str(row['num_vms'] or 'N/A'):>4} {str(row['cores_per_vm'] or 'N/A'):>8} "
+            f"{str(row['flows_per_vm'] or 'N/A'):>8} {row['viommu']:<12} {number(row['mean_gbps']):>10} "
+            f"{number(row['stddev_gbps']):>10} {number(row['mean_guest_cpu_pct']):>8} "
+            f"{row['successful_runs']:>3} {row['failed_runs']:>6}")
+    lines+=['', 'Per-configuration reports:']+[row['summary'] for row in rows]
+    text='\n'.join(lines)+'\n'
+    (directory/('summary-'+run_name+'.txt')).write_text(text)
+    return rows,text
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('directory')
-    parser.add_argument('--expected-runs', type=int, required=True)
+    parser.add_argument('--expected-runs', type=int)
+    parser.add_argument('--sweep', metavar='TIMESTAMP-DIRECTION', help='summarize this run across config/mode folders')
     args = parser.parse_args()
-    if args.expected_runs < 1:
+    if args.sweep:
+        _,text=sweep_summary(args.directory,args.sweep)
+        print(text,end='')
+        return 0
+    if args.expected_runs is None or args.expected_runs < 1:
         parser.error('--expected-runs must be positive')
     summary, text = aggregate(args.directory, args.expected_runs)
     print(text, end='')
@@ -231,4 +273,8 @@ def main():
 
 
 if __name__ == '__main__':
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        print(f'Summary failed: {exc}', file=sys.stderr)
+        raise SystemExit(1)

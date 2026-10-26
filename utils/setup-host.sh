@@ -1,3 +1,6 @@
+#!/bin/bash
+set -euo pipefail
+
 SCRIPT_NAME="setup-host"
 
 #default values
@@ -11,9 +14,7 @@ DISABLE_HYPER=1
 DISABLE_NUMA_BALANCE=1
 CPU_FREQ="2000MHz"
 CPUPOWER_PATH="/home/lbalara/viommu/linux-6.12.9/tools/power/cpupower" #TODO: HARDCODED
-VM_USER=schai
-VM_ADDR=192.168.122.53
-VM_KEY=/home/lbalara/.ssh/id_rsa
+INTF=""
 
 help()
 {
@@ -28,7 +29,7 @@ help()
 }
 
 SHORT=m:,h
-LONG=mtu:,socket-buf:,ecn:,hwpref:,rdma:,help
+LONG=intf:,mtu:,socket-buf:,ecn:,hwpref:,rdma:,help
 PARSED_OPTS=$(getopt -a -n $SCRIPT_NAME --options $SHORT --longoptions $LONG -- "$@")
 
 VALID_ARGUMENTS=$#
@@ -39,6 +40,7 @@ eval set -- "$PARSED_OPTS"
 
 while :;do
   case "$1" in
+    --intf) INTF="$2"; shift 2 ;;
     -m | --mtu) MTU="$2"; shift 2 ;;
     --socket-buf) TCP_SOCKET_BUF_MB="$2"; shift 2 ;;
     --ecn) ECN_ENABLED="$2"; shift 2 ;;
@@ -54,9 +56,13 @@ log_info() {
     echo "[INFO] - $1"
 }
 
-mkdir -p temp
-scp -i ${VM_KEY} ${VM_USER}@${VM_ADDR}:/proc/kallsyms temp/kallsyms
-scp -i ${VM_KEY} ${VM_USER}@${VM_ADDR}:/proc/modules temp/modules
+# A multi-VM setup must not read symbols from an unrelated fixed guest.
+if [[ -n "$INTF" ]]; then
+    sudo ip link set dev "$INTF" up
+    sudo ip link set dev "$INTF" mtu "$MTU"
+    sudo ethtool -A "$INTF" rx off tx off
+    sudo mlnx_qos -i "$INTF" --pfc 0,0,0,0,0,0,0,0
+fi
 
 if [ "$RDMA" -eq 1 ]; then
   log_info "Configuring MTU according to RDMA supported values..."
@@ -95,7 +101,7 @@ else
 fi
 
 if [ "$LOCK_FREQ" -eq 1 ]; then
-    log_info "Disabling turbo..."
+    log_info "Setting CPU frequency to $CPU_FREQ..."
     LD_LIBRARY_PATH=$CPUPOWER_PATH $CPUPOWER_PATH/cpupower --cpu all frequency-set --freq $CPU_FREQ
 fi
 
@@ -108,3 +114,7 @@ if [ "$DISABLE_NUMA_BALANCE" -eq 1 ]; then
     log_info "Disabling numa balance..."
     echo 0 > /proc/sys/kernel/numa_balancing
 fi
+# Throughput setup disables ftrace; perf sampling is independent.
+echo 0 > /sys/kernel/debug/tracing/tracing_on
+echo 0 > /sys/kernel/debug/tracing/events/enable
+echo nop > /sys/kernel/debug/tracing/current_tracer

@@ -8,21 +8,23 @@ export LIBVIRT_DEFAULT_URI="${LIBVIRT_DEFAULT_URI:-qemu:///system}"
 # Configuration
 # ============================================================
 
-GUEST_VIOMMU="nested-vFree" # off/nested/nested-vFree
+GUEST_VIOMMU="vFree-dlf" # off/nested/vFree-dlf/vFree-pin
 NUM_VMS=1
 NUM_TOTAL_CORES="16"
 NUM_ACTIVE_CORES="12"
 NUM_FLOWS="12"
 REUSE=0
 SKIP_RESET_HOST=0
-PERF_TRACING="vm0" # off/vm0/all; one host recording whenever enabled
-RECORD_COUNTERS=off # run_all.sh enables this by default
+PERF_TRACING="off" # off/vm0/all; one host recording whenever enabled
+RECORD_COUNTERS=off # optional NIC/IIO diagnostics
 MEASUREMENT_DURATION=20
 COUNTER_INTERVAL=1
 HOST_PF_BDF="${HOST_PF_BDF:-0000:98:00.0}"
 PCM_IIO_BIN="${PCM_IIO_BIN:-/home/lbalara/viommu/pcm/build/bin/pcm-iio}"
 PCM_IIO_DIR="${PCM_IIO_DIR:-/home/lbalara/viommu/pcm/src}"
 counter_pid=""
+SYNC_DIR=""
+RUN_TIMESTAMP=""
 RUN_LABEL=""
 RESULT_FILE=""
 TRAFFIC_DIRECTION="TX"
@@ -42,10 +44,11 @@ HOST_IP="192.17.101.97"
 HOST_SSH_UNAME="${SUDO_USER:-$(whoami)}"
 HOST_HOME="$(getent passwd "$HOST_SSH_UNAME" | cut -d: -f6)"
 HOST_RESULTS_DIR="${HOST_FandS_ABS}/utils/reports/"
+LOG_DIR=""
 
 # --- Client machine config ---
 CLIENT_HOME="/home/siyuanc3"
-CLIENT_FandS_REL="Fast-and-Safe-IO-Memory-Protection"
+CLIENT_FandS_REL="Fast-and-Safe-IO-Memory-Protection-many"
 CLIENT_SETUP_DIR_REL="utils"
 CLIENT_INTF="ens1006np0"
 CLIENT_IP="192.168.101.3"
@@ -88,8 +91,6 @@ NIC_WAIT=120      # seconds to wait for guest NIC
 # --- Guest NIC interface name (SR-IOV VF) ---
 GUEST_NIC="enp0s1"
 
-# --- Host-side in-tree modules (set after GUEST_KERNEL is resolved) ---
-# HOST_MLX5_CORE and HOST_MLXFW are set after --viommu parsing below
 
 # Save original directory
 ORIG_DIR="$(pwd)"
@@ -102,7 +103,7 @@ usage() {
 	cat <<-USAGE
 	Usage: $0 [OPTIONS]
 	  --direction DIR    Traffic direction: TX or RX (default: TX)
-	  --viommu MODE       Guest vIOMMU mode: off, nested, nested-vFree (default: $GUEST_VIOMMU)
+	  --viommu MODE       Guest vIOMMU mode: off, nested, vFree-dlf, vFree-pin (default: $GUEST_VIOMMU)
 	  --num-total-cores N    Total cores per VM
 	  --num-active-cores N   Active cores (iperf instances) per VM
 	  --num-flows N       Number of flows per VM experiment
@@ -111,10 +112,12 @@ usage() {
 	  --skip-reset-host   Skip host reset (host setup will still run)
 	  --boot-timeout N    Seconds to wait for SSH per VM (default: $BOOT_TIMEOUT)
 	  --perf-tracing MODE Record host and selected guests: off, vm0, all (default: off)
-	  --record-counters MODE Record NIC/CPU/TCP and host IIO: on or off (default: off)
+	  --record-counters MODE Optional NIC/IIO diagnostics: on or off (default: off)
 	  --duration N       Main measurement duration in seconds (default: 20)
 	  --counter-interval N Counter sampling interval in seconds (default: 1)
-	  --run-label LABEL  Append a repetition label to the experiment name
+	  --timestamp VALUE Common timestamp supplied by run_all.sh
+	  --run-label LABEL  Append a run label to the experiment name
+	  --reports-dir PATH Store this run's reports under PATH
 	  --result-file PATH Write machine-readable run status for sweep aggregation
 	  -h, --help          Show this help
 	USAGE
@@ -138,7 +141,9 @@ while [[ $# -gt 0 ]]; do
 	--record-counters) RECORD_COUNTERS="$2"; shift 2 ;;
 	--duration) MEASUREMENT_DURATION="$2"; shift 2 ;;
 	--counter-interval) COUNTER_INTERVAL="$2"; shift 2 ;;
+	--timestamp) RUN_TIMESTAMP="$2"; shift 2 ;;
 	--run-label) RUN_LABEL="$2"; shift 2 ;;
+	--reports-dir) HOST_RESULTS_DIR="$2"; shift 2 ;;
 	--result-file) RESULT_FILE="$2"; shift 2 ;;
 	-h|--help)       usage; exit 0      ;;
 	*)               echo "Error: unknown option '$1'" >&2; usage >&2; exit 1 ;;
@@ -178,6 +183,9 @@ if [[ -z "$NUM_TOTAL_CORES" || -z "$NUM_FLOWS" || -z "$NUM_VMS" || -z "$NUM_ACTI
 	exit 1
 fi
 
+mkdir -p "$HOST_RESULTS_DIR"
+HOST_RESULTS_DIR=$(readlink -f "$HOST_RESULTS_DIR")
+
 # --- Build client SSH command ---
 CLIENT_SETUP_DIR="${CLIENT_HOME}/${CLIENT_FandS_REL}/${CLIENT_SETUP_DIR_REL}"
 
@@ -203,23 +211,26 @@ nested)
 	GUEST_INITRD_PATH="/boot/initrd.img-$GUEST_KERNEL"
 	GUEST_CMD_LINE="$GUEST_CMD_LINE_BASE intel_iommu=on,sm_on iommu.strict=1"
 	;;
-nested-vFree)
-	GUEST_KERNEL="6.12.9-iommufd-nested-pin-mq"
+vFree-dlf)
+	GUEST_KERNEL="6.12.9-iommufd-nested-iova-contig-dlf-mq"
 	GUEST_KERNEL_PATH="/boot-VM/vmlinuz-$GUEST_KERNEL"
 	GUEST_INITRD_PATH="/boot-VM/initrd.img-$GUEST_KERNEL"
-	GUEST_CMD_LINE="$GUEST_CMD_LINE_BASE intel_iommu=on,sm_on iommu.strict=1 intel_iommu_pinned=on intel_iommu_dfp=on"
+	GUEST_CMD_LINE="$GUEST_CMD_LINE_BASE intel_iommu=on,sm_on iommu.strict=1 intel_iommu_pinned=off intel_iommu_dfp=on"
+	;;
+vFree-pin)
+	GUEST_KERNEL="6.12.9-iommufd-nested-pin-mq"
+        GUEST_KERNEL_PATH="/boot-VM/vmlinuz-$GUEST_KERNEL"
+        GUEST_INITRD_PATH="/boot-VM/initrd.img-$GUEST_KERNEL"
+        GUEST_CMD_LINE="$GUEST_CMD_LINE_BASE intel_iommu=on,sm_on iommu.strict=1 intel_iommu_pinned=on intel_iommu_dfp=on"
 	;;
 *)
-	echo "Error: unknown --viommu mode '$GUEST_VIOMMU' (expected: off, nested, nested-vFree)" >&2
+	echo "Error: unknown --viommu mode '$GUEST_VIOMMU' (expected: off, nested, vFree-dlf, vFree-pin)" >&2
 	exit 1
 	;;
 esac
 
 HOST_KERNEL="$(uname -r)"
 
-# --- Host-side in-tree modules to push into guests ---
-HOST_MLX5_CORE="/lib/modules/$GUEST_KERNEL/kernel/drivers/net/ethernet/mellanox/mlx5/core/mlx5_core.ko"
-HOST_MLXFW="/lib/modules/$GUEST_KERNEL/kernel/drivers/net/ethernet/mellanox/mlxfw/mlxfw.ko"
 
 # ============================================================
 # Helper functions
@@ -335,24 +346,20 @@ wait_for_nic() {
 	fi
 
 	echo "  ${name} (${ip}): $GUEST_NIC not found, pushing in-tree mlx5 modules..."
-	scp $SSH_OPTS "$HOST_MLX5_CORE" "$HOST_MLXFW" "$SSH_USER@$ip:/tmp/" &>/dev/null
-	scp $SSH_OPTS /tmp/modules.tar.gz "$SSH_USER@$ip:/tmp/" &>/dev/null
+	scp $SSH_OPTS /tmp/modules.tar.gz "$SSH_USER@$ip:/tmp/" &>/dev/null || return 1
 
 	ssh $SSH_OPTS "$SSH_USER@$ip" "
-		sudo tar xzf /tmp/modules.tar.gz -C /lib/modules/$(uname -r)/
+        set -e
+		sudo mkdir -p /lib/modules/\$(uname -r)/
+		sudo tar xzf /tmp/modules.tar.gz -C /lib/modules/\$(uname -r)/
 		sudo rm -f /lib/modules/\$(uname -r)/updates/dkms/mlx5_core.ko \
 		           /lib/modules/\$(uname -r)/updates/dkms/mlx5-vfio-pci.ko \
 		           /lib/modules/\$(uname -r)/updates/dkms/mlxfw.ko \
 		           /lib/modules/\$(uname -r)/updates/dkms/mlx_compat.ko \
 		           /lib/modules/\$(uname -r)/updates/dkms/mlxdevm.ko
-		sudo mkdir -p /lib/modules/\$(uname -r)/kernel/drivers/net/ethernet/mellanox/mlx5/core
-		sudo mkdir -p /lib/modules/\$(uname -r)/kernel/drivers/net/ethernet/mellanox/mlxfw
-		sudo cp /tmp/mlx5_core.ko /lib/modules/\$(uname -r)/kernel/drivers/net/ethernet/mellanox/mlx5/core/
-		sudo cp /tmp/mlxfw.ko /lib/modules/\$(uname -r)/kernel/drivers/net/ethernet/mellanox/mlxfw/
 		sudo depmod -a 2>/dev/null
 		sudo modprobe mlx5_core 2>/dev/null
-		sudo modprobe msr 2>/dev/null
-	" &>/dev/null
+	" &>/dev/null || return 1
 
 	local elapsed=0
 	while [[ $elapsed -lt $NIC_WAIT ]]; do
@@ -412,46 +419,19 @@ check_client_kernel() {
 
 # --- Client environment setup (run once from host before experiments) ---
 setup_client() {
-	log_info "Setting up client environment on $CLIENT_SSH_HOST..."
-
-	# Disable flow control
-	log_info "Disabling TX/RX pause on client interface $CLIENT_INTF"
-	$SSH_CLIENT_CMD "sudo ethtool --pause $CLIENT_INTF tx off rx off"
-
-	# Disable SMT
-	log_info "Disabling SMT on client"
-	$SSH_CLIENT_CMD "echo off | sudo tee /sys/devices/system/cpu/smt/control"
-
-	# Run client setup-envir.sh
-	log_info "Running client setup-envir.sh..."
-	$SSH_CLIENT_CMD "cd '$CLIENT_SETUP_DIR'; \
-		sudo bash setup-envir.sh \
-			--dep '$CLIENT_HOME' \
-			--intf '$CLIENT_INTF' \
-			--ip '$CLIENT_IP' \
-			-m '$MTU' \
-			-d '$DDIO_ENABLED' \
-			-r '$RING_BUFFER_SIZE' \
-			--socket-buf '$TCP_SOCKET_BUF_MB' \
-			--hwpref 1 --rdma 0 --pfc 0 --ecn 1 --opt 1"
-
-	$SSH_CLIENT_CMD "sudo pkill -9 -f iperf"
-
-	log_info "Client setup complete"
+    log_info "Setting up client environment"
+    $SSH_CLIENT_CMD "cd '$CLIENT_HOME/$CLIENT_FandS_REL' && sudo -n bash utils/setup-envir.sh --role physical --dep '$CLIENT_HOME' --intf '$CLIENT_INTF' --ip '$CLIENT_IP' -m '$MTU' -d keep -r '$RING_BUFFER_SIZE' --socket-buf '$TCP_SOCKET_BUF_MB' --hwpref 1 --rdma 0 --pfc 0 --ecn 1 --opt 1" || return 1
+    # No matching processes is success; transport/permission errors are not.
+    $SSH_CLIENT_CMD 'sudo -n pkill -x iperf3; rc=$?; test "$rc" -eq 0 -o "$rc" -eq 1' || return 1
+    log_info "Client setup complete"
 }
 
-# --- Host environment setup (run locally, this IS the host) ---
 setup_host() {
-	log_info "Setting up host environment..."
-
-	cd "$HOST_SETUP_DIR" || { log_error "Failed to cd to $HOST_SETUP_DIR"; return 1; }
-	sudo bash setup-host.sh \
-		-m "$MTU" \
-		--socket-buf "$TCP_SOCKET_BUF_MB" \
-		--hwpref 1 --rdma 0 --ecn 1
-	cd "$ORIG_DIR"
-
-	log_info "Host setup complete"
+    pf_interface=$(basename /sys/bus/pci/devices/"$HOST_PF_BDF"/net/*) || return 1
+    sudo -n bash "$HOST_SETUP_DIR/setup-host.sh" \
+        --intf "$pf_interface" -m "$MTU" --socket-buf "$TCP_SOCKET_BUF_MB" \
+        --hwpref 1 --rdma 0 --ecn 1 || return 1
+    log_info "Host setup complete"
 }
 
 # Own only the recorder created for this run. Its children have bounded lifetimes.
@@ -465,35 +445,33 @@ stop_counter_recorder() {
 finish_run() {
 	local run_rc=$?
 	trap - EXIT
+    if [[ "$run_rc" -ne 0 && -n "$SYNC_DIR" && -d "$SYNC_DIR" ]]; then
+        : > "$SYNC_DIR/failed"
+    fi
 	stop_counter_recorder
 	if [[ -n "$RESULT_FILE" ]]; then
 		if ! python3 - "$RESULT_FILE" "$run_rc" "$EXP_NAME" "$HOST_RESULTS_DIR" \
 			"$GUEST_VIOMMU" "$NUM_VMS" "$NUM_TOTAL_CORES" "$NUM_ACTIVE_CORES" "$NUM_FLOWS" \
 			"$MEASUREMENT_DURATION" "$COUNTER_INTERVAL" "$RECORD_COUNTERS" "$PERF_TRACING" \
-			"$RUN_LABEL" "${traffic_direction:-unknown}" "$GUEST_KERNEL" "$ORIG_DIR" "${vm_names[@]}" <<'RESULT'
+			"$RUN_LABEL" "${traffic_direction:-unknown}" "$GUEST_KERNEL" "${vm_names[@]}" <<'RESULT'
 import json
 import platform
 from pathlib import Path
-import shutil
 import sys
 
 (destination, rc, experiment, reports, viommu, num_vms, total, active, flows,
- duration, interval, counters, perf, label, direction, guest_kernel, log_directory, *vm_names) = sys.argv[1:]
+ duration, interval, counters, perf, label, direction, guest_kernel, *vm_names) = sys.argv[1:]
 report = (Path(reports) / experiment).resolve() if experiment else None
-result = dict(schema_version=1, status='complete' if int(rc) == 0 else 'failed',
+result = dict(schema_version=2, measurement_basis="synchronized-iperf", status='complete' if int(rc) == 0 else 'failed',
               exit_code=int(rc), experiment=experiment, report_directory=str(report) if report else None,
               run_label=label, vm_names=vm_names,
-              configuration=dict(viommu=viommu, num_vms=int(num_vms), total_cores=int(total),
+              configuration=dict(measurement_basis="synchronized-iperf", viommu=viommu, num_vms=int(num_vms), total_cores=int(total),
                                  active_cores=int(active), flows=int(flows), direction=direction,
                                  duration_s=int(duration), interval_s=int(interval),
                                  record_counters=counters, perf_tracing=perf, host_kernel=platform.release(),
                                  guest_kernel=guest_kernel))
 if report:
     report.mkdir(parents=True, exist_ok=True)
-    for name in vm_names:
-        source = Path(log_directory) / (name + '_experiment.log')
-        if source.exists() and experiment in source.read_text(errors='replace'):
-            shutil.copy2(source, report / ('host-' + name + '_experiment.log'))
 path = Path(destination).resolve()
 path.parent.mkdir(parents=True, exist_ok=True)
 temporary = path.with_name(path.name + '.tmp')
@@ -584,11 +562,13 @@ if [[ $REUSE -eq 0 ]]; then
 		--vcpus $NUM_TOTAL_CORES --num-vms $NUM_VMS --viommu $GUEST_VIOMMU
 fi
 
-timestamp=$(date '+%Y-%m-%d-%H-%M-%S')
+timestamp="${RUN_TIMESTAMP:-$(date '+%Y-%m-%d-%H-%M-%S')}"
 EXP_NAME="${timestamp}-HOST-$HOST_KERNEL-GUEST-$GUEST_KERNEL-MANY-${traffic_direction}-flow${NUM_FLOWS}-${iommu_config}-${NUM_TOTAL_CORES}cores-${NUM_ACTIVE_CORES}active-cores"
 if [[ -n "$RUN_LABEL" ]]; then
 	EXP_NAME+="-${RUN_LABEL}"
 fi
+LOG_DIR="$HOST_RESULTS_DIR/$EXP_NAME"
+mkdir -p "$LOG_DIR"
 
 echo "============================================================"
 echo "  VM Benchmark Runner"
@@ -621,7 +601,7 @@ if [[ ${#xml_files[@]} -lt $NUM_VMS ]]; then
 	exit 1
 fi
 
-IFS=$'\n' xml_files=($(sort <<<"${xml_files[*]}")); unset IFS
+IFS=$'\n' xml_files=($(sort -V <<<"${xml_files[*]}")); unset IFS
 
 vm_names=()
 for ((i = 0; i < NUM_VMS; i++)); do
@@ -691,9 +671,9 @@ for ((i = 0; i < NUM_VMS; i++)); do
 	name="${vm_names[$i]}"
 	virsh start "$name"
 	sleep 2
-	script -q -c "virsh console $name" "${name}.log" > /dev/null 2>&1 &
+	script -q -c "virsh console $name" "$LOG_DIR/${name}.console.log" > /dev/null 2>&1 &
 	console_pids+=($!)
-	echo "  Started: ${name} (console -> ${name}.log)"
+	echo "  Started: ${name} (console -> $LOG_DIR/${name}.console.log)"
 done
 
 # --- Step 9: Wait for SSH on all VMs ---
@@ -784,50 +764,34 @@ if ! setup_host; then
 	exit 1
 fi
 
-# Guest runners and wrappers come from the Git sync in Step 11.
-TELEMETRY_DIR=""
+# The host runner owns workload readiness and phase signals.
+SYNC_DIR="${HOST_RESULTS_DIR%/}/${EXP_NAME}/sync"
+TELEMETRY_DIR="${HOST_RESULTS_DIR%/}/${EXP_NAME}/counters"
 TELEMETRY_HELPER="${HOST_FandS_ABS}/multi_vms/record_sweep.py"
-if [[ "$RECORD_COUNTERS" == on ]]; then
-	pf_interfaces=(/sys/bus/pci/devices/"$HOST_PF_BDF"/net/*)
-	if [[ ${#pf_interfaces[@]} -ne 1 || ! -e "${pf_interfaces[0]}" ]]; then
-		log_error "Expected one host PF interface for $HOST_PF_BDF"
-		cleanup
-		exit 1
-	fi
-	TELEMETRY_DIR="${HOST_RESULTS_DIR%/}/${EXP_NAME}/counters"
-	mkdir -p "$TELEMETRY_DIR"
-	# Guest-to-host barrier SSH uses the invoking user's account, also under sudo.
-	if [[ $EUID -eq 0 ]]; then
-		chown "$HOST_SSH_UNAME" "$TELEMETRY_DIR"
-	fi
-	python3 "$TELEMETRY_HELPER" coordinate \
-		--output "$TELEMETRY_DIR" --experiment "$EXP_NAME" --direction "$traffic_direction" \
-		--viommu "$GUEST_VIOMMU" --num-vms "$NUM_VMS" --total-cores "$NUM_TOTAL_CORES" \
-		--active-cores "$NUM_ACTIVE_CORES" --flows "$NUM_FLOWS" \
-		--duration "$MEASUREMENT_DURATION" --interval "$COUNTER_INTERVAL" \
-		--host-interface "${pf_interfaces[0]##*/}" \
-		--peer-interface "$CLIENT_INTF" --peer-ip "$CLIENT_IP" --peer-ssh "$SSH_CLIENT_CMD" \
-		--guest-interface "$GUEST_NIC" --guest-ssh "ssh $SSH_OPTS" \
-		--guest-user "$SSH_USER" --guest-ip-base "$IP_BASE" --guest-data-ip-base "192.168.101.11" \
-		--pcm-bin "$PCM_IIO_BIN" --pcm-dir "$PCM_IIO_DIR" \
-		>"$TELEMETRY_DIR/coordinator.log" 2>&1 &
-	counter_pid=$!
-	for ((attempt = 0; attempt < 120; attempt++)); do
-		[[ -f "$TELEMETRY_DIR/armed.json" ]] && break
-		if ! kill -0 "$counter_pid" 2>/dev/null; then
-			log_error "Counter preflight failed: $TELEMETRY_DIR/coordinator.log"
-			cleanup
-			exit 1
-		fi
-		sleep 1
-	done
-	if [[ ! -f "$TELEMETRY_DIR/armed.json" ]]; then
-		log_error "Counter preflight timed out: $TELEMETRY_DIR/coordinator.log"
-		cleanup
-		exit 1
-	fi
-	log_info "Counter recording armed: $TELEMETRY_DIR"
+mkdir -p "$SYNC_DIR" "$TELEMETRY_DIR"
+if [[ $EUID -eq 0 ]]; then
+    chown "$HOST_SSH_UNAME" "$SYNC_DIR" "$TELEMETRY_DIR"
 fi
+
+wait_for_vm_phase() {
+    local phase=$1 deadline=$((SECONDS + ${2:-600})) i ready
+    while ((SECONDS < deadline)); do
+        ready=1
+        for ((i=0;i<NUM_VMS;i++)); do
+            [[ -f "$SYNC_DIR/$phase-ready-vm$i" ]] || ready=0
+            if ! kill -0 "${ssh_pids[$i]}" 2>/dev/null; then
+                log_error "${vm_names[$i]} exited before the $phase signal"
+                : > "$SYNC_DIR/failed"
+                return 1
+            fi
+        done
+        [[ "$ready" -eq 1 ]] && return 0
+        sleep .2
+    done
+    log_error "Timed out waiting for all VMs: $phase"
+    : > "$SYNC_DIR/failed"
+    return 1
+}
 
 # --- Step 13: Run experiment on all VMs simultaneously ---
 echo ""
@@ -859,18 +823,63 @@ for ((i = 0; i < NUM_VMS; i++)); do
 		--exp-name ${EXP_NAME}-${name} \
 		--host-ip ${HOST_IP} --host-ssh-uname ${HOST_SSH_UNAME} \
 		--host-home ${HOST_HOME} --host-results-dir ${HOST_RESULTS_DIR} \
-		--perf-tracing ${perf_guest} --perf-host-tracing ${perf_host} --duration ${MEASUREMENT_DURATION}"
-	if [[ "$RECORD_COUNTERS" == on ]]; then
-		printf -v counter_args ' --telemetry-dir %q --telemetry-helper %q' "$TELEMETRY_DIR" "$TELEMETRY_HELPER"
-		vm_cmd+="$counter_args"
-	fi
-	ssh $SSH_OPTS "$SSH_USER@$ip" "$vm_cmd" &>"${name}_experiment.log" &
+		--perf-tracing ${perf_guest} --perf-host-tracing ${perf_host} --duration ${MEASUREMENT_DURATION} --sync-dir ${SYNC_DIR}"
+	ssh $SSH_OPTS "$SSH_USER@$ip" "$vm_cmd" &>"$LOG_DIR/host-${name}_experiment.log" &
 	ssh_pids+=($!)
-	echo "  Launched on ${name} (${ip}), log -> ${name}_experiment.log"
+	echo "  Launched on ${name} (${ip}), log -> $LOG_DIR/host-${name}_experiment.log"
 done
 
 echo ""
-log_info "All experiments launched. Waiting for completion..."
+log_info "Waiting for all VMs to be ready for warmup..."
+if ! wait_for_vm_phase warmup; then cleanup; exit 1; fi
+: > "$SYNC_DIR/warmup.start"
+log_info "Warmup released for all VMs"
+if ! wait_for_vm_phase measure; then cleanup; exit 1; fi
+if [[ "$RECORD_COUNTERS" == on ]]; then
+log_info "All VMs warmed up; starting the counter sampler"
+python3 "$TELEMETRY_HELPER" collect \
+	--output "$TELEMETRY_DIR" --experiment "$EXP_NAME" --direction "$traffic_direction" \
+	--viommu "$GUEST_VIOMMU" --num-vms "$NUM_VMS" --total-cores "$NUM_TOTAL_CORES" \
+	--active-cores "$NUM_ACTIVE_CORES" --flows "$NUM_FLOWS" \
+	--duration "$MEASUREMENT_DURATION" --interval "$COUNTER_INTERVAL" \
+	--host-interface "$pf_interface" \
+	--peer-interface "$CLIENT_INTF" --peer-ssh "$SSH_CLIENT_CMD" \
+	--guest-interface "$GUEST_NIC" --guest-ssh "ssh $SSH_OPTS" \
+	--guest-user "$SSH_USER" --guest-ip-base "$IP_BASE" \
+	--pcm-bin "$PCM_IIO_BIN" --pcm-dir "$PCM_IIO_DIR" \
+	>"$TELEMETRY_DIR/coordinator.log" 2>&1 &
+counter_pid=$!
+# The sampler reports its scheduled capture time. Only this runner releases VMs.
+for ((attempt=0;attempt<180;attempt++)); do
+    [[ -f "$TELEMETRY_DIR/start.json" ]] && break
+    if ! kill -0 "$counter_pid" 2>/dev/null; then
+        log_error "Counter sampler failed before measurement start"
+        : > "$SYNC_DIR/failed"
+        cleanup
+        exit 1
+    fi
+    sleep 1
+done
+if [[ ! -f "$TELEMETRY_DIR/start.json" ]]; then
+    log_error "Counter sampler did not become ready"
+    : > "$SYNC_DIR/failed"
+    cleanup
+    exit 1
+fi
+python3 - "$TELEMETRY_DIR/start.json" <<'START_TIME'
+import json,sys,time
+start=json.load(open(sys.argv[1]))['unix_s']
+time.sleep(max(0,start-time.time()))
+START_TIME
+if ! kill -0 "$counter_pid" 2>/dev/null; then
+    log_error "Counter sampler exited before the measurement signal"
+    : > "$SYNC_DIR/failed"
+    cleanup
+    exit 1
+fi
+fi
+: > "$SYNC_DIR/measure.start"
+log_info "Measurement released for all VMs. Waiting for completion..."
 
 any_failed=false
 for ((i = 0; i < NUM_VMS; i++)); do
@@ -915,7 +924,7 @@ SUMMARY_DIR="${HOST_RESULTS_DIR}/${EXP_NAME}"
 mkdir -p "$SUMMARY_DIR"
 cd "${HOST_FandS_ABS}/scripts" || true
 report_rc=0
-python3 "$REPORT_SCRIPT" "$EXP_NAME" tput,cpu "$NUM_VMS" | tee "$SUMMARY_DIR/summary.txt" || report_rc=$?
+python3 "$REPORT_SCRIPT" "$EXP_NAME" tput,cpu "$NUM_VMS" "$HOST_RESULTS_DIR" | tee "$SUMMARY_DIR/summary.txt" || report_rc=$?
 append_counter_summary
 cd "$ORIG_DIR"
 if [[ "$report_rc" -ne 0 ]]; then

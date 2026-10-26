@@ -1,23 +1,25 @@
 #!/usr/bin/env python3
-"""Per-run evidence collection; only the coordinator writes to the host report tree.
+"""Per-run NIC/TCP-protocol and host IIO diagnostics; only the coordinator writes to the host report tree.
 
 The same file is streamed to remote Python interpreters, so endpoints need no
-checkout or installed Python packages. No NIC/CPU/IOMMU settings are changed.
+checkout or installed Python packages. Endpoint configuration belongs to
+utils/setup-envir.sh and utils/setup-host.sh; CPU utilization and application throughput are collected by the existing workload scripts.
 """
 import argparse
-import concurrent.futures
 import csv
 import json
 import math
 import os
 from pathlib import Path
 import re
+import selectors
 import shlex
 import shutil
 import signal
 import socket
 import subprocess
 import sys
+import threading
 import time
 
 START_LEAD_S = 10
@@ -56,158 +58,115 @@ def wait_until(epoch):
         time.sleep(max(0, min(.2, deadline - time.monotonic())))
 
 
-def probe(interface):
-    missing = [name for name in ('ethtool', 'ss', 'ip') if not shutil.which(name)]
-    if not Path('/sys/class/net', interface).is_dir():
-        missing.append('interface ' + interface)
-    return dict(**stamp(), hostname=socket.gethostname(), missing=missing)
-
-
-def socket_counters(raw):
-    connections = {}
-    key = None
-    for line in raw.splitlines():
-        if not line.startswith((' ', '\t')):
-            fields = line.split()
-            key = ' '.join(fields[3:5]) if len(fields) >= 5 and fields[0] == 'ESTAB' else None
-        elif key:
-            connections.setdefault(key, {}).update({m[1]: int(m[2]) for m in re.finditer(
-                r'\b(bytes_acked|bytes_received|bytes_retrans|bytes_sent|segs_out|segs_in|data_segs_out|data_segs_in):([0-9]+)', line)})
-    return connections
-
-
-def snapshot(interface, peers):
+def snapshot(interface):
     begin = stamp()
-    cpu_raw = read('/proc/stat') or ''
-    cpus = {line.split()[0]: list(map(int, line.split()[1:9]))
-            for line in cpu_raw.splitlines() if re.match(r'^cpu\d* ', line)}
     protocols = {}
-    raw_proc = {name: read('/proc/' + name) for name in (
-        'stat', 'softirqs', 'interrupts', 'net/softnet_stat', 'net/snmp', 'net/netstat')}
     for name in ('net/snmp', 'net/netstat'):
-        lines = (raw_proc[name] or '').splitlines()
+        lines = (read('/proc/' + name) or '').splitlines()
         for header, values in zip(lines[::2], lines[1::2]):
             labels, counts = header.split(), values.split()
-            protocols.update({labels[0].rstrip(':') + '.' + k: int(v)
-                              for k, v in zip(labels[1:], counts[1:])})
+            protocols.update({labels[0].rstrip(':') + '.' + key: int(value)
+                              for key, value in zip(labels[1:], counts[1:])})
     nic = command(['ethtool', '-S', interface])
     nic_values = {m[1]: int(m[2]) for m in re.finditer(
         r'^\s*(\S+):\s*(\d+)\s*$', nic['stdout'], re.M)}
-    # Restrict to workload peers: excludes SSH/control-plane connections.
-    filters = []
-    if peers:
-        filters.append('(')
-        for index, peer in enumerate(peers):
-            if index:
-                filters.append('or')
-            filters.extend(['dst', peer])
-        filters.append(')')
-    tcp_start = stamp()
-    tcp = command(['ss', '-tinH', 'state', 'established'] + filters)
-    # `state established` omits the State column. Normalize for stable endpoint keys.
-    normalized = '\n'.join('ESTAB ' + line if line and not line[0].isspace() else line
-                           for line in tcp['stdout'].splitlines())
-    tcp_end = stamp()
-    net_stats = Path('/sys/class/net', interface, 'statistics')
-    frequency = {}
-    for cpu in cpus:
-        if cpu == 'cpu':
-            continue
-        base = Path('/sys/devices/system/cpu', cpu, 'cpufreq')
-        frequency[cpu] = {k: read(base / k) for k in ('scaling_cur_freq', 'scaling_governor')}
-    return dict(begin=begin, end=stamp(), cpu=cpus, protocol=protocols,
-                proc_raw=raw_proc, ethtool=nic_values, ethtool_raw=nic,
-                sysfs={p.name: int(p.read_text()) for p in net_stats.iterdir()},
-                frequency=frequency,
-                tcp=dict(begin=tcp_start, end=tcp_end, raw=tcp,
-                         connections=socket_counters(normalized)))
+    stats = Path('/sys/class/net', interface, 'statistics')
+    return dict(begin=begin, end=stamp(), protocol=protocols,
+                ethtool=nic_values, ethtool_raw=nic,
+                sysfs={p.name: int(p.read_text()) for p in stats.iterdir()})
 
 
 def summarize(before, after):
-    elapsed = after['begin']['monotonic_s'] - before['begin']['monotonic_s']
-    result = dict(elapsed_s=elapsed, delta={}, counter_resets={}, cpu_busy_pct={})
+    result = dict(elapsed_s=after['begin']['monotonic_s'] - before['begin']['monotonic_s'],
+                  delta={}, counter_resets={})
     for group in ('ethtool', 'protocol', 'sysfs'):
-        common = {k for k in before[group].keys() & after[group].keys()
-                  if not k.startswith('outbound_pci_stalled_') and k != 'Tcp.CurrEstab'}
-        result['delta'][group] = {k: after[group][k] - before[group][k] for k in common
-                                  if after[group][k] >= before[group][k]}
-        result['counter_resets'][group] = [k for k in common if after[group][k] < before[group][k]]
-    for cpu in before['cpu'].keys() & after['cpu'].keys():
-        ticks = [a - b for a, b in zip(after['cpu'][cpu], before['cpu'][cpu])]
-        if sum(ticks) > 0 and min(ticks) >= 0:
-            result['cpu_busy_pct'][cpu] = 100 * (sum(ticks) - ticks[3] - ticks[4]) / sum(ticks)
-    b, a = before['tcp']['connections'], after['tcp']['connections']
-    stable = a.keys() & b.keys()
-    fields = ('bytes_acked', 'bytes_received', 'bytes_retrans', 'bytes_sent')
-    # ss omits zero-valued TCP_INFO fields (notably bytes_retrans).
-    per_socket = {k: {f: a[k].get(f, 0) - b[k].get(f, 0) for f in fields
-                      if a[k].get(f, 0) >= b[k].get(f, 0)} for k in stable}
-    tcp_elapsed = (after['tcp']['begin']['monotonic_s'] - before['tcp']['begin']['monotonic_s'])
-    totals = {f: sum(values.get(f, 0) for values in per_socket.values()) for f in fields}
-    result['tcp'] = dict(elapsed_s=tcp_elapsed, stable_socket_count=len(stable),
-                         opened=sorted(a.keys() - b.keys()), closed=sorted(b.keys() - a.keys()),
-                         counter_resets={k: [f for f in fields if a[k].get(f, 0) < b[k].get(f, 0)]
-                                         for k in stable},
-                         per_socket_delta=per_socket, delta=totals,
-                         gbps={f: v * 8 / tcp_elapsed / 1e9 for f, v in totals.items()})
+        common = {key for key in before[group].keys() & after[group].keys()
+                  if not key.startswith('outbound_pci_stalled_') and key != 'Tcp.CurrEstab'}
+        result['delta'][group] = {key: after[group][key] - before[group][key]
+                                  for key in common if after[group][key] >= before[group][key]}
+        result['counter_resets'][group] = [key for key in common
+                                           if after[group][key] < before[group][key]]
     return result
 
 
 def capture(args):
     metadata = dict(hostname=socket.gethostname(), kernel=os.uname().release,
                     cmdline=read('/proc/cmdline'), interface=args.interface,
-                    peers=args.peer, scheduled_start_unix_s=args.start_at,
+                    scheduled_start_unix_s=args.start_at,
                     requested_duration_s=args.duration,
                     ethtool={flag: command(['ethtool', flag, args.interface])
                              for flag in ('-i', '-a', '-g', '-c', '-k', '-l', '-x')},
                     link=command(['ip', '-details', '-statistics', 'link', 'show', 'dev', args.interface]),
                     addresses=command(['ip', 'address', 'show', 'dev', args.interface]),
-                    lscpu=command(['lscpu', '-e']),
                     device=str(Path('/sys/class/net', args.interface, 'device').resolve()))
+    if getattr(args, 'controlled', False):
+        # Preparation can take seconds under load. Do it before choosing a start.
+        print(json.dumps(dict(event='ready', **stamp())), file=sys.stderr, flush=True)
+        message = json.loads(sys.stdin.readline())
+        if message['command'] != 'clock':
+            raise RuntimeError('expected clock request')
+        print(json.dumps(dict(event='clock', **stamp())), file=sys.stderr, flush=True)
+        message = json.loads(sys.stdin.readline())
+        if message['command'] != 'start':
+            raise RuntimeError('expected capture start')
+        args.start_at = message['unix_s']
+        metadata['scheduled_start_unix_s'] = args.start_at
     wait_until(args.start_at)
     metadata['start_lateness_s'] = time.time() - args.start_at
-    samples = []
-    start = time.monotonic()
-    index = 0
-    while True:
-        samples.append(snapshot(args.interface, args.peer))
-        if len(samples) > 1 and samples[-1]['begin']['monotonic_s'] >= start + args.duration:
-            break
-        index += 1
-        delay = min(start + index * args.interval, start + args.duration) - time.monotonic()
-        if delay > 0:
-            time.sleep(delay)
+    samples = [snapshot(args.interface)]
+    # Diagnostics need before/after readings. PCM performs periodic IIO sampling.
+    deadline = samples[0]['begin']['monotonic_s'] + args.duration
+    time.sleep(max(0, deadline - time.monotonic()))
+    samples.append(snapshot(args.interface))
     errors = [dict(sample=i, tool=key, **s[key])
               for i, s in enumerate(samples)
               for key in ('ethtool_raw',) if s[key]['returncode']]
-    errors.extend(dict(sample=i, tool='ss', **s['tcp']['raw'])
-                  for i, s in enumerate(samples) if s['tcp']['raw']['returncode'])
     if metadata['start_lateness_s'] > 2:
         errors.append(dict(tool='timing', error='capture started more than 2 seconds late'))
-    if args.peer and not any(s['tcp']['connections'] for s in samples):
-        errors.append(dict(tool='ss', error='no established workload sockets observed'))
-    print(json.dumps(dict(schema_version=1, metadata=metadata, samples=samples,
-                          summary=summarize(samples[0], samples[-1]), errors=errors)))
+    summary = summarize(samples[0], samples[-1])
+    print(json.dumps(dict(schema_version=2, metadata=metadata, samples=samples,
+                          summary=summary, errors=errors)))
     return int(bool(errors))
 
 
-def barrier(output, vm_id):
-    output = Path(output)
-    (output / ('ready-vm' + str(vm_id))).touch()
-    deadline = time.monotonic() + 360
-    while time.monotonic() < deadline:
-        if (output / 'failed.json').exists():
-            raise RuntimeError('telemetry coordinator failed; see ' + str(output))
-        if (output / 'start.json').exists():
-            wait_until(json.loads((output / 'start.json').read_text())['unix_s'])
-            return 0
-        time.sleep(.2)
-    raise TimeoutError('timed out waiting for telemetry start')
-
-
-def endpoint_command(endpoint, arguments):
-    python = ['sudo', '-n', 'python3', '-'] + arguments
+def endpoint_command(endpoint, arguments, controlled=False):
+    if controlled:
+        # Read a length-prefixed source, leaving stdin open for clock/start messages.
+        bootstrap = "import sys; exec(compile(sys.stdin.read(int(sys.stdin.readline())), '<collector>', 'exec'))"
+        python = ['sudo', '-n', 'python3', '-u', '-c', bootstrap] + arguments
+    else:
+        python = ['sudo', '-n', 'python3', '-'] + arguments
     return endpoint['ssh'] + [shlex.join(python)] if endpoint['ssh'] else python
+
+
+def collector_messages(captures, event, timeout=120):
+    messages = {}
+    deadline = time.monotonic() + timeout
+    with selectors.DefaultSelector() as selector:
+        for endpoint, process, log in captures:
+            selector.register(process.stderr, selectors.EVENT_READ, (endpoint, log))
+        while selector.get_map():
+            if time.monotonic() > deadline:
+                pending = ', '.join(key.data[0]['name'] for key in selector.get_map().values())
+                raise TimeoutError('collectors did not report ' + event + ': ' + pending)
+            for key, _ in selector.select(.2):
+                endpoint, log = key.data
+                line = key.fileobj.readline()
+                log.write(line)
+                log.flush()
+                try:
+                    message = json.loads(line)
+                except ValueError:
+                    if not line:
+                        raise RuntimeError(endpoint['name'] + ' collector failed before ' + event + '; see its .log')
+                    # Preserve sudo/SSH warnings and tracebacks; EOF or the timeout
+                    # determines whether a collector actually failed to prepare.
+                    continue
+                if message.get('event') != event:
+                    raise RuntimeError(endpoint['name'] + ' unexpected collector event: ' + str(message))
+                messages[endpoint['name']] = dict(message, received_unix_s=time.time())
+                selector.unregister(key.fileobj)
+    return messages
 
 
 def iio_mean_rates(path):
@@ -237,11 +196,10 @@ def render_summary(output):
     manifest = json.loads((output / 'manifest.json').read_text())
     lines = ['', '======= Counter recording summary =======',
              f"Status: {manifest.get('status', 'incomplete')}",
-             f"Window: {manifest['duration_s']:g} s; sampling: {manifest['interval_s']:g} s",
+             f"Window: {manifest['duration_s']:g} s; IIO sampling: {manifest['interval_s']:g} s",
              'Raw evidence: counters/']
     if manifest.get('error'):
         lines.append('Error: ' + manifest['error'])
-    received = {}
     for name in ['host', 'peer'] + ['vm' + str(i) for i in range(manifest['num_vms'])]:
         try:
             evidence = json.loads((output / (name + '.json')).read_text())
@@ -250,10 +208,7 @@ def render_summary(output):
             continue
         summary = evidence['summary']
         elapsed = summary['elapsed_s']
-        cpu = summary['cpu_busy_pct'].get('cpu')
         lines.append(f"--- {name}: {evidence['metadata']['interface']}; measured {elapsed:.3f} s ---")
-        if cpu is not None:
-            lines.append(f'  CPU busy (all CPUs, idle/iowait excluded): {cpu:.2f}%')
         nic = summary['delta']['ethtool']
         sysfs = summary['delta']['sysfs']
         lines.append('  NIC sysfs RX/TX: ' + ' / '.join(
@@ -272,22 +227,10 @@ def render_summary(output):
         for key in ('Tcp.RetransSegs', 'TcpExt.TCPTimeouts', 'TcpExt.TCPRcvQDrop'):
             if key in summary['delta']['protocol']:
                 lines.append(f"  {key} delta: {summary['delta']['protocol'][key]}")
-        if evidence['metadata']['peers']:
-            tcp = summary['tcp']
-            received[name] = tcp['gbps']['bytes_received']
-            lines.append(f"  TCP received / acked: {tcp['gbps']['bytes_received']:.3f} / "
-                         f"{tcp['gbps']['bytes_acked']:.3f} Gbit/s ({tcp['elapsed_s']:.3f} s)")
-            lines.append(f"  TCP retransmitted bytes: {tcp['delta']['bytes_retrans']}; "
-                         f"stable sockets: {tcp['stable_socket_count']}; "
-                         f"opened/closed: {len(tcp['opened'])}/{len(tcp['closed'])}")
         resets = sum(sum(key != 'Tcp.CurrEstab' for key in values)
                      for values in summary['counter_resets'].values())
         if resets or evidence['errors']:
             lines.append(f"  Counter resets: {resets}; capture errors: {len(evidence['errors'])}")
-    receivers = ['vm' + str(i) for i in range(manifest['num_vms'])] if manifest['direction'] == 'RX' else ['peer']
-    if all(name in received for name in receivers):
-        lines.append(f"Delivered {manifest['direction']} over counter window: "
-                     f"{sum(received[name] for name in receivers):.3f} Gbit/s")
     lines.append('--- Host IIO (mean rates; event groups are multiplexed) ---')
     try:
         means = iio_mean_rates(output / 'iio.csv')
@@ -310,52 +253,29 @@ def render_summary(output):
     return '\n'.join(lines) + '\n'
 
 
-def coordinate(args):
+def collect(args):
     output = Path(args.output).resolve()
     source = Path(__file__).read_text()
     output.mkdir(parents=True, exist_ok=True)
     if any((output / name).exists() for name in ('manifest.json', 'armed.json', 'start.json', 'failed.json')):
         raise FileExistsError('recording directory already contains evidence: ' + str(output))
-    # Retain the exact collector used with the evidence.
-    (output / 'collector.py').write_text(source)
-    endpoints = [dict(name='host', interface=args.host_interface, ssh=[], peers=[]),
-                 dict(name='peer', interface=args.peer_interface, ssh=shlex.split(args.peer_ssh),
-                      peers=[args.guest_data_ip_base.rsplit('.', 1)[0] + '.' +
-                             str(int(args.guest_data_ip_base.rsplit('.', 1)[1]) + i)
-                             for i in range(args.num_vms)])]
+    endpoints = [dict(name='host', interface=args.host_interface, ssh=[]),
+                 dict(name='peer', interface=args.peer_interface, ssh=shlex.split(args.peer_ssh))]
     for i in range(args.num_vms):
-        endpoints.append(dict(name='vm' + str(i), interface=args.guest_interface,
-                              ssh=shlex.split(args.guest_ssh) + [args.guest_user + '@' +
-                                  args.guest_ip_base.rsplit('.', 1)[0] + '.' +
-                                  str(int(args.guest_ip_base.rsplit('.', 1)[1]) + i)],
-                              peers=[args.peer_ip]))
+        endpoints.append(dict(name='vm'+str(i), interface=args.guest_interface,
+            ssh=shlex.split(args.guest_ssh)+[args.guest_user+'@'+
+                args.guest_ip_base.rsplit('.',1)[0]+'.'+
+                str(int(args.guest_ip_base.rsplit('.',1)[1])+i)]))
     children = []
     handles = []
+    captures = []
+    log_threads = []
     manifest = dict(schema_version=1, experiment=args.experiment, direction=args.direction,
                     num_vms=args.num_vms, total_cores=args.total_cores,
                     active_cores=args.active_cores, flows=args.flows, viommu=args.viommu,
-                    duration_s=args.duration, interval_s=args.interval, endpoints=[])
+                    duration_s=args.duration, interval_s=args.interval, endpoints=[],
+                    measurement_basis='network-and-iio-diagnostics')
     try:
-        def check(endpoint):
-            begin = time.time()
-            try:
-                p = subprocess.run(endpoint_command(endpoint, ['probe', '--interface', endpoint['interface']]),
-                                   input=source, text=True, capture_output=True, timeout=45)
-            except subprocess.TimeoutExpired:
-                raise TimeoutError(endpoint['name'] + ' preflight timed out') from None
-            end = time.time()
-            if p.returncode:
-                raise RuntimeError(endpoint['name'] + ' preflight: ' + p.stderr)
-            info = json.loads(p.stdout)
-            if info['missing']:
-                raise RuntimeError(endpoint['name'] + ' missing: ' + ', '.join(info['missing']))
-            # Correct endpoint wall-clock skew using SSH round-trip midpoint.
-            endpoint['clock_offset_s'] = info['unix_s'] - (begin + end) / 2
-            endpoint['clock_uncertainty_s'] = (end - begin) / 2
-            endpoint['hostname'] = info['hostname']
-
-        with concurrent.futures.ThreadPoolExecutor(max_workers=len(endpoints)) as pool:
-            list(pool.map(check, endpoints))
         pcm = Path(args.pcm_bin).resolve()
         pcm_dir = Path(args.pcm_dir).resolve()
         if not pcm.is_file() or not os.access(pcm, os.X_OK) or not pcm_dir.is_dir():
@@ -378,25 +298,41 @@ def coordinate(args):
                                source_event_directory=str(pcm_dir))
         atomic_json(output / 'manifest.json', manifest)
         atomic_json(output / 'armed.json', stamp())
-        deadline = time.monotonic() + args.ready_timeout
-        while not all((output / ('ready-vm' + str(i))).exists() for i in range(args.num_vms)):
-            if time.monotonic() > deadline:
-                raise TimeoutError('not all VMs reached the post-warmup barrier')
-            time.sleep(.2)
-        start = time.time() + START_LEAD_S
         for endpoint in endpoints:
             arguments = ['capture', '--interface', endpoint['interface'], '--duration', str(args.duration),
-                         '--interval', str(args.interval), '--start-at', str(start + endpoint['clock_offset_s'])]
-            for peer in endpoint['peers']:
-                arguments += ['--peer', peer]
+                         '--controlled']
             stdout = (output / (endpoint['name'] + '.json')).open('w')
             stderr = (output / (endpoint['name'] + '.log')).open('w')
             handles += [stdout, stderr]
-            process = subprocess.Popen(endpoint_command(endpoint, arguments), stdin=subprocess.PIPE,
-                                       stdout=stdout, stderr=stderr, text=True)
-            process.stdin.write(source)
-            process.stdin.close()
+            process = subprocess.Popen(endpoint_command(endpoint, arguments, controlled=True), stdin=subprocess.PIPE,
+                                       stdout=stdout, stderr=subprocess.PIPE, text=True)
             children.append((endpoint['name'], process))
+            captures.append((endpoint, process, stderr))
+            process.stdin.write(str(len(source)) + '\n' + source)
+            process.stdin.flush()
+        collector_messages(captures, 'ready')
+        # Refresh clocks over established channels after metadata/preparation, so
+        # SSH startup and the warmup duration do not bias the offsets.
+        clock_begin = {}
+        for endpoint, process, _ in captures:
+            clock_begin[endpoint['name']] = time.time()
+            process.stdin.write(json.dumps(dict(command='clock')) + '\n')
+            process.stdin.flush()
+        clocks = collector_messages(captures, 'clock', timeout=15)
+        for endpoint, _, _ in captures:
+            info = clocks[endpoint['name']]
+            begin, end = clock_begin[endpoint['name']], info['received_unix_s']
+            endpoint['clock_offset_s'] = info['unix_s'] - (begin + end) / 2
+            endpoint['clock_uncertainty_s'] = (end - begin) / 2
+        manifest['endpoints'] = [{k: v for k, v in e.items() if k != 'ssh'} for e in endpoints]
+        start = time.time() + START_LEAD_S
+        for endpoint, process, log in captures:
+            process.stdin.write(json.dumps(dict(command='start', unix_s=start + endpoint['clock_offset_s'])) + '\n')
+            process.stdin.close()
+            thread = threading.Thread(target=shutil.copyfileobj, args=(process.stderr, log), daemon=True)
+            thread.start()
+            log_threads.append(thread)
+        atomic_json(output / 'manifest.json', manifest)
         atomic_json(output / 'start.json', dict(unix_s=start))
         wait_until(start)
         pcm_log = (output / 'iio.log').open('w')
@@ -410,32 +346,34 @@ def coordinate(args):
         deadline = time.monotonic() + args.duration + 90
         for name, process in children:
             statuses[name] = process.wait(timeout=max(1, deadline - time.monotonic()))
+        for thread in log_threads:
+            thread.join(timeout=5)
         for handle in handles:
             handle.close()
         manifest['pcm'].update(argv=pcm_argv, begin=pcm_begin, end=stamp())
         manifest['returncodes'] = statuses
         manifest['scheduled_start_unix_s'] = start
         # Empty/truncated data is a failed recording even if the command returned 0.
-        failures = [name for name, rc in statuses.items() if rc]
+        failures = {name for name, rc in statuses.items() if rc}
         for endpoint in endpoints:
             evidence = json.loads((output / (endpoint['name'] + '.json')).read_text())
             if evidence['errors']:
-                failures.append(endpoint['name'])
+                failures.add(endpoint['name'])
         csv_path = output / 'iio.csv'
         if not csv_path.exists() or csv_path.stat().st_size == 0:
-            failures.append('empty iio.csv')
+            failures.add('empty iio.csv')
         else:
             with csv_path.open() as stream:
                 rows = csv.DictReader(stream)
                 columns = rows.fieldnames or []
                 if not (any('IOTLB' in c for c in columns) and any('IOMMU' in c for c in columns)):
-                    failures.append('IIO event configuration lacks IOTLB/IOMMU counters')
+                    failures.add('IIO event configuration lacks IOTLB/IOMMU counters')
                 if next(rows, None) is None:
-                    failures.append('iio.csv has no samples')
+                    failures.add('iio.csv has no samples')
         manifest['status'] = 'failed' if failures else 'complete'
         atomic_json(output / 'manifest.json', manifest)
         if failures:
-            raise RuntimeError('recording failed: ' + ', '.join(failures))
+            raise RuntimeError('recording failed: ' + ', '.join(sorted(failures)))
         return 0
     except BaseException as exc:
         manifest.update(status='failed', error=str(exc))
@@ -451,6 +389,17 @@ def coordinate(args):
                 except subprocess.TimeoutExpired:
                     process.kill()
                     process.wait()
+        for thread in log_threads:
+            thread.join(timeout=5)
+        for _, process, log in captures:
+            if not log.closed and not log_threads:
+                log.write(process.stderr.read())
+            process.stderr.close()
+            if not process.stdin.closed:
+                try:
+                    process.stdin.close()
+                except BrokenPipeError:
+                    pass
         for handle in handles:
             handle.close()
 
@@ -458,41 +407,29 @@ def coordinate(args):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest='mode', required=True)
-    p = sub.add_parser('probe')
-    p.add_argument('--interface', required=True)
     p = sub.add_parser('capture')
     p.add_argument('--interface', required=True)
-    p.add_argument('--peer', action='append', default=[])
     p.add_argument('--duration', type=float, default=20)
-    p.add_argument('--interval', type=float, default=1)
-    p.add_argument('--start-at', type=float, required=True)
-    p = sub.add_parser('barrier')
-    p.add_argument('output')
-    p.add_argument('vm_id', type=int)
+    group = p.add_mutually_exclusive_group(required=True)
+    group.add_argument('--start-at', type=float)
+    group.add_argument('--controlled', action='store_true')
     p = sub.add_parser('summary')
     p.add_argument('output')
-    p = sub.add_parser('coordinate')
+    p = sub.add_parser('collect')
     for name in ('output', 'experiment', 'direction', 'viommu', 'host-interface', 'peer-interface',
-                 'peer-ip', 'peer-ssh', 'guest-interface', 'guest-ssh', 'guest-user', 'guest-ip-base',
-                 'guest-data-ip-base',
+                 'peer-ssh', 'guest-interface', 'guest-ssh', 'guest-user', 'guest-ip-base',
                  'pcm-bin', 'pcm-dir'):
         p.add_argument('--' + name, required=True)
     for name in ('num-vms', 'total-cores', 'active-cores', 'flows'):
         p.add_argument('--' + name, type=int, required=True)
     p.add_argument('--duration', type=float, default=20)
     p.add_argument('--interval', type=float, default=1)
-    p.add_argument('--ready-timeout', type=float, default=600)
     args = parser.parse_args()
     for name in ('duration', 'interval'):
         if hasattr(args, name) and (not math.isfinite(getattr(args, name)) or getattr(args, name) <= 0):
             parser.error('--' + name + ' must be finite and positive')
-    if args.mode == 'probe':
-        print(json.dumps(probe(args.interface)))
-        return 0
     if args.mode == 'capture':
         return capture(args)
-    if args.mode == 'barrier':
-        return barrier(args.output, args.vm_id)
     if args.mode == 'summary':
         summary = render_summary(args.output)
         (Path(args.output) / 'summary.txt').write_text(summary)
@@ -500,7 +437,7 @@ def main():
         return 0
     # Ensure SIGTERM follows the same cleanup path as ordinary failures.
     signal.signal(signal.SIGTERM, lambda *_: (_ for _ in ()).throw(InterruptedError('terminated')))
-    return coordinate(args)
+    return collect(args)
 
 
 if __name__ == '__main__':

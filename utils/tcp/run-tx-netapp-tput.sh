@@ -2,6 +2,7 @@
 SCRIPT_NAME="run-netapp-tput"
 
 #default values
+ISOLATED=0
 MODE="server"
 OUT_DIR="tcptest"
 SERVER_IP="192.168.11.127"
@@ -26,8 +27,8 @@ help()
 }
 
 SHORT=o:,n:,N:,p:,c:,b:,h
-LONG=mode:,outdir:,num_servers:,num_clients:,port:,server-ip:,cores:,bandwidth:,help
-OPTS=$(getopt -a -n run-netapp-tput --options $SHORT --longoptions $LONG -- "$@")
+LONG=isolated,mode:,outdir:,num_servers:,num_clients:,port:,server-ip:,cores:,bandwidth:,help
+OPTS=$(getopt -a -n run-netapp-tput --options $SHORT --longoptions $LONG -- "$@") || exit 2
 VALID_ARGUMENTS=$# # Returns the count of arguments that are in short or long options
 if [ "$VALID_ARGUMENTS" -eq 0 ]; then
   help
@@ -36,6 +37,7 @@ eval set -- "$OPTS"
 
 while :;do
   case "$1" in
+    --isolated) ISOLATED=1; shift ;;
     --mode) MODE="$2"; shift 2 ;;
     -o | --outdir) OUT_DIR="$2"; shift 2 ;;
     -n | --num_servers) NUM_SERVERS="$2"; shift 2 ;;
@@ -50,6 +52,13 @@ while :;do
   esac
 done
 
+if [[ "$ISOLATED" -eq 1 ]]; then
+    set -euo pipefail
+    iperf_pids=()
+    trap 'if [[ ${#iperf_pids[@]} -gt 0 ]]; then kill "${iperf_pids[@]}" 2>/dev/null || true; wait || true; fi' EXIT
+    trap 'exit 1' HUP INT TERM
+fi
+
 IFS=',' read -ra core_values <<< $CPU_MASK
 
 mkdir -p ../reports #Directory to store collected logs
@@ -61,24 +70,43 @@ rm -f ../logs/$OUT_DIR/iperf.bw.log
 
 counter=0
 if [ "$MODE" = "server" ]; then
-    sudo pkill -9 -f iperf #kill existing iperf servers/clients
+    if [[ "$ISOLATED" -eq 0 ]]; then sudo pkill -9 -f iperf || true; fi
     while [ $counter -lt $NUM_SERVERS ]; do
         index=$(( counter % ${#core_values[@]} ))
         core=${core_values[index]}
         echo "Starting server $counter on core $core"
-        sudo taskset -c $core nice -n -20 iperf3 -s --port $(($PORT + $counter)) -i 1 -f m &
-        ((counter++))
+        report_args=(-i 1 -f m)
+        if [[ "$ISOLATED" -eq 1 ]]; then
+            report_args=(-i 1 -f m --forceflush --logfile "../logs/$OUT_DIR/iperf.bw.$counter.log")
+        fi
+        sudo taskset -c $core nice -n -20 iperf3 -s --port $(($PORT + $counter)) "${report_args[@]}" &
+        if [[ "$ISOLATED" -eq 1 ]]; then iperf_pids+=("$!"); fi
+        ((counter+=1))
     done
 elif [ "$MODE" = "client" ]; then
-    sudo pkill -9 -f iperf #kill existing iperf servers/clients
+    if [[ "$ISOLATED" -eq 0 ]]; then sudo pkill -9 -f iperf || true; fi
     while [ $counter -lt $NUM_CLIENTS ]; do
         index=$(( counter % ${#core_values[@]} ))
         core=${core_values[index]}
         echo "Starting client $counter on core $core"
-        taskset -c $core nice -n -20 iperf3 -c $SERVER_IP --port $(($PORT+$(($counter%$NUM_SERVERS)))) -i 30 -f m -t 10000 -C dctcp -b $BANDWIDTH --logfile ../logs/$OUT_DIR/iperf.bw.log &
-        ((counter++))
+        report_args=(-i 30 -f m --logfile "../logs/$OUT_DIR/iperf.bw.log")
+        if [[ "$ISOLATED" -eq 1 ]]; then
+            report_args=(-i 1 -f m --forceflush --logfile "../logs/$OUT_DIR/iperf.bw.$counter.log")
+        fi
+        taskset -c $core nice -n -20 iperf3 -c $SERVER_IP --port $(($PORT+$(($counter%$NUM_SERVERS)))) -t 10000 -C dctcp -b $BANDWIDTH "${report_args[@]}" &
+        if [[ "$ISOLATED" -eq 1 ]]; then iperf_pids+=("$!"); fi
+        ((counter+=1))
     done
 else
     echo "incorrect argument specified"
     help
+fi
+
+# Isolated traffic is owned by the guest runner until its measurement finishes.
+# Any flow ending before cleanup fails this launcher, including a zero exit.
+if [[ "$ISOLATED" -eq 1 ]]; then
+    rc=0
+    wait -n "${iperf_pids[@]}" || rc=$?
+    echo "iperf flow exited before experiment cleanup (exit $rc)" >&2
+    exit 1
 fi

@@ -4,9 +4,9 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
-# VIOMMU_MODES=("off" "nested-vFree" "nested")
-VIOMMU_MODES=("off")
-TRAFFIC_DIRECTION="TX"
+VIOMMU_MODES=("off" "vFree-dlf" "nested" "vFree-pin")
+# VIOMMU_MODES=("off")
+TRAFFIC_DIRECTION="RX"
 NUM_RUNS=1
 
 # --- Experiment configurations ---
@@ -15,9 +15,9 @@ NUM_RUNS=1
 CONFIGS=(
 	# "1 32 32 32"
 	"2 16 16 16"
-	# "4 8 8 8"
-	# "8 4 4 4"
-	# "16 2 2 2"
+	"4 8 8 8"
+	"8 4 4 4"
+	"16 2 2 2"
 	# "2 16 16 16"
 	# "4 16 16 16"
 )
@@ -41,7 +41,10 @@ fi
 
 REPORTS_DIR="${SCRIPT_DIR}/../utils/reports"
 mkdir -p "$REPORTS_DIR"
-SUMMARY_FILES=()
+REPORTS_DIR=$(readlink -f "$REPORTS_DIR")
+RUN_TIMESTAMP=$(date +%Y-%m-%d-%H-%M-%S)
+RUN_NAME="${RUN_TIMESTAMP}-${TRAFFIC_DIRECTION}"
+echo "Run timestamp: $RUN_TIMESTAMP"
 
 run_idx=0
 failed_runs=0
@@ -52,22 +55,19 @@ for config in "${CONFIGS[@]}"; do
 	read -r num_vms num_total_cores num_active_cores num_flows <<< "$config"
 	for viommu in "${VIOMMU_MODES[@]}"; do
 		config_name="vms${num_vms}-total${num_total_cores}-active${num_active_cores}-flows${num_flows}"
-		SWEEP_TIMESTAMP=$(date +%Y-%m-%d-%H-%M-%S)
-		SWEEP_DIR="${REPORTS_DIR}/sweep-${SWEEP_TIMESTAMP}-${TRAFFIC_DIRECTION}-${config_name}-viommu-${viommu}"
-		mkdir "$SWEEP_DIR"
-		SWEEP_DIR=$(readlink -f "$SWEEP_DIR")
-		config_dir="$SWEEP_DIR"
-		SUMMARY_FILES+=("$SWEEP_DIR/summary.txt")
-		echo "Sweep reports: $SWEEP_DIR"
-		: > "$SWEEP_DIR/summary.txt"
-		for ((repetition = 1; repetition <= NUM_RUNS; repetition++)); do
+    config_dir="$REPORTS_DIR/${config_name}-viommu-${viommu}/$RUN_NAME"
+    mkdir -p "$(dirname "$config_dir")"
+    mkdir "$config_dir"
+    echo "Configuration reports: $config_dir"
+
+		for ((run_number = 1; run_number <= NUM_RUNS; run_number++)); do
 			run_idx=$((run_idx + 1))
-			printf -v rep_name 'rep-%03d' "$repetition"
-			rep_dir="$config_dir/$rep_name"
-			mkdir -p "$rep_dir"
+			printf -v run_label 'run-%02d' "$run_number"
+			run_dir="$config_dir/$run_label"
+			mkdir -p "$run_dir"
 			echo ""
 			echo "================================================================"
-			echo "  Run ${run_idx}/${total}, repetition ${repetition}/${NUM_RUNS}: --direction ${TRAFFIC_DIRECTION} --viommu ${viommu}" \
+			echo "  Run ${run_idx}/${total}, ${run_label}/${NUM_RUNS}: --direction ${TRAFFIC_DIRECTION} --viommu ${viommu}" \
 				"--num-vms ${num_vms} --num-total-cores ${num_total_cores}" \
 				"--num-active-cores ${num_active_cores} --num-flows ${num_flows}"
 			echo "================================================================"
@@ -78,9 +78,9 @@ for config in "${CONFIGS[@]}"; do
 				--num-total-cores "$num_total_cores" --num-active-cores "$num_active_cores" \
 				--num-flows "$num_flows" \
 				--direction "$TRAFFIC_DIRECTION" \
-				--run-label "$rep_name" \
-				--result-file "$rep_dir/result.json" 2>&1 | tee "$rep_dir/launcher.log" || rc=$?
-			printf '%s\n' "$rc" > "$rep_dir/exit-code"
+				--timestamp "$RUN_TIMESTAMP" --run-label "$run_label" \
+				--reports-dir "$run_dir" --result-file "$run_dir/result.json" 2>&1 | tee "$run_dir/launcher.log" || rc=$?
+			printf '%s\n' "$rc" > "$run_dir/exit-code"
 			if [[ $rc -ne 0 ]]; then
 				failed_runs=$((failed_runs + 1))
 				echo "WARNING: Run ${run_idx} failed (exit $rc), continuing..."
@@ -92,9 +92,13 @@ for config in "${CONFIGS[@]}"; do
 	done
 done
 
-echo "All ${total} repetitions finished; ${failed_runs} launcher failures."
-printf 'Combined summary: %s\n' "${SUMMARY_FILES[@]}"
+if ! python3 "$SCRIPT_DIR/summarize_runs.py" "$REPORTS_DIR" --sweep "$RUN_NAME"; then
+    summary_failed=1
+fi
+
+echo "All ${total} runs finished; ${failed_runs} launcher failures."
 if [[ "$failed_runs" -gt 0 || "$summary_failed" -ne 0 ]]; then
-	echo "WARNING: experiments failed or had incomplete reports; inspect per-run logs and configuration summaries." >&2
+	echo "WARNING: experiments failed or had incomplete reports; summary failed; inspect per-run logs." >&2
 	exit 1
 fi
+echo "Combined summary: $REPORTS_DIR/summary-$RUN_NAME.txt ($REPORTS_DIR/summary-$RUN_NAME.csv)"

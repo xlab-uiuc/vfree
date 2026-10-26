@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Treat unset variables as an error when substituting.
-set -u
+set -euo pipefail
 
 #-------------------------------------------------------------------------------
 # CONFIGURATION AND PATHS
@@ -11,18 +11,16 @@ INIT_PORT=3000
 MLC_DURATION_S=100
 GUEST_MLC_DIR_REL="mlc/Linux"
 
-FTRACE_BUFFER_SIZE_KB=20000
-FTRACE_OVERWRITE_ON_FULL=0 # 0=no overwrite (tracing stops when full), 1=overwrite
 PERF_TRACING_ENABLED=0
 PERF_TRACING_HOST_ENABLED=0
-TELEMETRY_DIR=""
-TELEMETRY_HELPER=""
+SYNC_DIR=""
+traffic_pids=()
 
 # --- Base Directory Paths (Relative to respective home directories) ---
 SCRIPT_DIR=$(dirname "$0")
 GUEST_FandS_REL=$(basename $(realpath "$SCRIPT_DIR/../"))
 GUEST_PERF_REL="linux-6.12.9/tools/perf/perf"
-CLIENT_FandS_REL="Fast-and-Safe-IO-Memory-Protection"
+CLIENT_FandS_REL="Fast-and-Safe-IO-Memory-Protection-many"
 
 HOST_PERF="/home/lbalara/viommu/linux-6.12.9/tools/perf/perf"
 
@@ -147,7 +145,7 @@ help() {
 SHORT_OPTS="n:c:N:C:e:m:d:b:r:h"
 LONG_OPTS="guest-home:,guest-ip:,guest-intf:,guest-bus:,guest-num:,guest-cpu-mask:,\
 client-home:,client-ip:,client-intf:,client-num:,client-cpu-mask:,\
-host-home:,host-ip:,host-ssh-name:,perf-tracing:,perf-host-tracing:,telemetry-dir:,telemetry-helper:,\
+host-home:,host-results-dir:,host-ip:,host-ssh-name:,perf-tracing:,perf-host-tracing:,sync-dir:,\
 vm-id:,exp-name:,mtu:,ddio:,bandwidth:,ring-buffer:,mlc-cores:,socket-buf:,dur:,runs:,ebpf-tracing:,mem-stats:,\
 client-ssh-name:,client-ssh-host:,client-ssh-use-pass:,client-ssh-pass:,client-ssh-ifile:,help"
 
@@ -172,12 +170,12 @@ while :; do
 	-N | --client-num) CLIENT_NUM_CLIENTS="$2"; shift 2 ;;
 	-C | --client-cpu-mask) CLIENT_CPU_MASK="$2"; shift 2 ;;
 	--host-home) HOST_HOME="$2"; shift 2 ;;
+	--host-results-dir) HOST_RESULTS_DIR="$2"; shift 2 ;;
 	--host-ip) HOST_IP="$2"; shift 2 ;;
 	--host-ssh-name) HOST_SSH_UNAME="$2"; shift 2 ;;
 	--perf-tracing) PERF_TRACING_ENABLED="$2"; shift 2 ;;
 	--perf-host-tracing) PERF_TRACING_HOST_ENABLED="$2"; shift 2 ;;
-	--telemetry-dir) TELEMETRY_DIR="$2"; shift 2 ;;
-	--telemetry-helper) TELEMETRY_HELPER="$2"; shift 2 ;;
+	--sync-dir) SYNC_DIR="$2"; shift 2 ;;
 	--vm-id) VM_ID="$2"; shift 2 ;;
 	-e | --exp-name) EXP_NAME="$2"; shift 2 ;;
 	-m | --mtu) MTU="$2"; shift 2 ;;
@@ -291,6 +289,7 @@ progress_bar() {
 
 		printf "[%-*s] %3d%% (%*ds/%ds)\r" "$progress_bar_width" "$bar_visual" "$progress_percent" \
 			"${#duration_secs}" "$elapsed_time_secs" "$duration_secs"
+        multi_vm_check_traffic || exit 1
 		sleep "$interval_secs"
 	done
 
@@ -304,25 +303,17 @@ pre_exp_setup() {
 	log_info "--- Starting Pre-experiment Setup (guest-only) ---"
 
 	log_info "Disabling TX/RX pause on GUEST interface $GUEST_INTF"
-	sudo ethtool --pause "$GUEST_INTF" tx off rx off
+	log_info "Guest VF: physical pause policy is enforced by host/peer setup"
 
 	log_info "--- Pre-experiment Setup Finished ---"
 }
 
-# --- Guest-only post-experiment cleanup (no host reset) ---
-post_exp_cleanup() {
-	log_info "--- Starting Post-experiment Cleanup (guest-only) ---"
-
-	log_info "Resetting GUEST ftrace..."
-	sudo sh -c 'echo 0 > /sys/kernel/debug/tracing/tracing_on'
-	sudo sh -c 'echo 0 > /sys/kernel/debug/tracing/options/overwrite'
-	sudo sh -c 'echo 20000 > /sys/kernel/debug/tracing/buffer_size_kb'
-
-	log_info "--- Post-experiment Cleanup Finished ---"
-}
-
 # --- Cleanup: guest processes and THIS VM's client sessions only ---
 cleanup() {
+    local pid
+    for pid in "${traffic_pids[@]}"; do kill "$pid" 2>/dev/null || true; done
+    for pid in "${traffic_pids[@]}"; do wait "$pid" 2>/dev/null || true; done
+    traffic_pids=()
 	log_info "--- Starting Cleanup Phase ---"
 
 	log_info "Killing local 'loaded_latency', 'iperf' processes..."
@@ -397,7 +388,7 @@ save_config_to_report_json() {
 	  "test_params": {
 	    "core_duration_s": "$CORE_DURATION_S",
 	    "mtu": "$MTU",
-	    "ddio_enabled": "$DDIO_ENABLED",
+	    "ddio_policy": "preserve physical platform state; guest VF setup skips DDIO",
 	    "ring_buffer_size": "$RING_BUFFER_SIZE",
 	    "tcp_socket_buf_mb": "$TCP_SOCKET_BUF_MB",
 	    "mlc_cores": "$MLC_CORES",
@@ -445,12 +436,11 @@ log_info "############################################################"
 # Files within the client dir also get vm prefix for safety in case the
 # caller passes a shared EXP_NAME.
 current_guest_reports_dir="${GUEST_SETUP_DIR}/reports/${EXP_NAME}-RUN-${j}"
-host_reports_dir_remote="${HOST_SETUP_DIR}/reports/${EXP_NAME}-RUN-${j}"
+host_reports_dir_remote="${HOST_RESULTS_DIR:-${HOST_SETUP_DIR}/reports}/${EXP_NAME}-RUN-${j}"
 client_reports_dir_remote="${CLIENT_SETUP_DIR}/reports/${EXP_NAME}-RUN-${j}"
 
 perf_guest_data_file="${current_guest_reports_dir}/perf_guest_cpu.data"
 perf_host_data_file_remote="${host_reports_dir_remote}/perf_host_cpu.data"
-iova_ftrace_guest_output_file="${current_guest_reports_dir}/iova_ftrace_guest.txt"
 ebpf_guest_stats="${current_guest_reports_dir}/ebpf_guest_stats.csv"
 guest_server_app_log_file="${current_guest_reports_dir}/server_app.log"
 guest_mlc_log_file="${current_guest_reports_dir}/mlc.log"
@@ -463,6 +453,8 @@ sudo mkdir -p "$current_guest_reports_dir"
 
 # --- Pre-run cleanup ---
 cleanup
+trap cleanup EXIT
+trap 'exit 1' HUP INT TERM
 
 # --- Save config ---
 save_config_to_report_json "$current_guest_reports_dir"
@@ -493,53 +485,42 @@ fi
 # --- Setup Guest (Server) Environment ---
 log_info "Setting up GUEST server environment..."
 cd "$GUEST_SETUP_DIR" || { log_error "Failed to cd to $GUEST_SETUP_DIR"; exit 1; }
-sudo bash setup-envir.sh --dep "$GUEST_HOME" --intf "$GUEST_INTF" --ip "$GUEST_IP" -m "$MTU" -d "$DDIO_ENABLED" -r "$RING_BUFFER_SIZE" \
-	--socket-buf "$TCP_SOCKET_BUF_MB" --hwpref 1 --rdma 0 --pfc 0 --ecn 1 --opt 1 --nic-bus "$GUEST_NIC_BUS"
+sudo -n bash setup-envir.sh --role guest --dep "$GUEST_HOME" \
+    --intf "$GUEST_INTF" --ip "$GUEST_IP" --nic-bus "$GUEST_NIC_BUS" \
+    -m "$MTU" -d keep -r "$RING_BUFFER_SIZE" --socket-buf "$TCP_SOCKET_BUF_MB" \
+    --hwpref 1 --rdma 0 --pfc 0 --ecn 1 --opt 1
 cd - > /dev/null
 
 # --- Start Guest (Server) Application ---
 log_info "Starting GUEST server application; logs at $guest_server_app_log_file"
 cd "$GUEST_EXP_DIR" || { log_error "Failed to cd to $GUEST_EXP_DIR"; exit 1; }
-sudo bash run-netapp-tput.sh --mode server -n "$GUEST_NUM_SERVERS" -N "$CLIENT_NUM_CLIENTS" -o "${EXP_NAME}-RUN-${j}" \
+sudo bash run-netapp-tput.sh --isolated --mode server -n "$GUEST_NUM_SERVERS" -N "$CLIENT_NUM_CLIENTS" -o "${EXP_NAME}-RUN-${j}" \
 	-p "$INIT_PORT" -c "$GUEST_CPU_MASK" &>"$guest_server_app_log_file" &
+traffic_pids+=("$!")
 sleep 2 # Allow server app to initialize
 cd - > /dev/null
 
+log_info "Ready for warmup; waiting for host signal..."
+multi_vm_check_traffic || exit 1
+multi_vm_wait_for_signal warmup || exit 1
+
 # --- Start Clients (traffic generation only, no client setup-envir.sh) ---
-# Uses VM-specific screen session name and port offset.
-log_info "Starting CLIENT traffic on $CLIENT_SSH_HOST (screen: $SCREEN_CLIENT_SESSION, port: $INIT_PORT); logs at $client_app_log_file_remote..."
-client_cmd="mkdir -p '$client_reports_dir_remote'; cd '$CLIENT_EXP_DIR'; sudo bash many-run-netapp-tput.sh --mode client --server-ip '$GUEST_IP' -n '$GUEST_NUM_SERVERS' -N '$CLIENT_NUM_CLIENTS' -o '${EXP_NAME}-RUN-${j}' -p '$INIT_PORT' -c '$CLIENT_CPU_MASK' -b '$CLIENT_BANDWIDTH' &>'$client_app_log_file_remote'; exec bash"
-$SSH_CLIENT_CMD "screen -dmS $SCREEN_CLIENT_SESSION sudo bash -c \"$client_cmd\""
+# The SSH child carries traffic-launcher failures back to this runner.
+log_info "Starting CLIENT traffic on $CLIENT_SSH_HOST (port: $INIT_PORT); logs at $client_app_log_file_remote..."
+client_cmd="mkdir -p '$client_reports_dir_remote' && cd '$CLIENT_EXP_DIR' && exec sudo -n bash run-netapp-tput.sh --isolated --mode client --server-ip '$GUEST_IP' -n '$GUEST_NUM_SERVERS' -N '$CLIENT_NUM_CLIENTS' -o '${EXP_NAME}-RUN-${j}' -p '$INIT_PORT' -c '$CLIENT_CPU_MASK' -b '$CLIENT_BANDWIDTH' >'$client_app_log_file_remote' 2>&1"
+$SSH_CLIENT_CMD "$client_cmd" &
+traffic_pids+=("$!")
 
 # --- Warmup Phase ---
 log_info "Warming up experiment (120 seconds)..."
 progress_bar 120 2
 
-# SSH may reject a burst of guest connections at MaxStartups. The host barrier
-# is idempotent, so transport failures can be retried without releasing it early.
-wait_for_counter_barrier() {
-    local barrier_command attempt rc
-    printf -v barrier_command 'python3 %q barrier %q %q' "$TELEMETRY_HELPER" "$TELEMETRY_DIR" "$VM_ID"
-    for ((attempt = 1; attempt <= 8; attempt++)); do
-        rc=0
-        $SSH_HOST_CMD -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=2 "$barrier_command" || rc=$?
-        [[ $rc -eq 0 ]] && return 0
-        # Exit 255 is an SSH transport failure; coordinator errors must propagate.
-        [[ $rc -eq 255 && $attempt -lt 8 ]] || return "$rc"
-        log_info "Barrier SSH connection failed; retry ${attempt}/8..."
-        sleep "$((attempt + VM_ID % 3))"
-    done
-}
+# Traffic stays active while every VM finishes its warmup.
+log_info "Warmup complete; waiting for host measurement-start signal..."
+multi_vm_check_traffic || exit 1
+multi_vm_wait_for_signal measure || exit 1
+multi_vm_check_traffic || exit 1
 
-# Every VM keeps traffic running while waiting for the common capture window.
-if [[ -n "$TELEMETRY_DIR" ]]; then
-    log_info "Waiting at post-warmup counter recording barrier..."
-    if ! wait_for_counter_barrier; then
-        log_error "Counter recording barrier failed"
-        cleanup
-        exit 1
-    fi
-fi
 
 if [ "$EBPF_TRACING_HOST_ENABLED" -eq 1 ]; then
     log_info "Starting HOST eBPF tracer on $HOST_IP..."
@@ -559,12 +540,8 @@ fi
 # sleep 2
 
 # --- Guest Ftrace Setup ---
-log_info "Configuring GUEST ftrace (Buffer: ${FTRACE_BUFFER_SIZE_KB}KB, Overwrite: ${FTRACE_OVERWRITE_ON_FULL})..."
-sudo sh -c "echo $FTRACE_BUFFER_SIZE_KB > /sys/kernel/debug/tracing/buffer_size_kb"
-sudo sh -c "echo $FTRACE_OVERWRITE_ON_FULL > /sys/kernel/debug/tracing/options/overwrite"
-sudo sh -c 'echo > /sys/kernel/debug/tracing/trace'
-sudo sh -c 'echo 1 > /sys/kernel/debug/tracing/tracing_on'
-log_info "GUEST ftrace is ON."
+# Throughput/perf runs never enable ftrace; endpoint setup clears prior state.
+log_info "Guest ftrace disabled (perf sampling is a separate option)."
 
 # --- Start Main Profiling & Logging Phase ---
 if [ "$PERF_TRACING_ENABLED" -eq 1 ]; then
@@ -583,30 +560,24 @@ fi
 log_info "Starting CLIENT-side logging (screen: $SCREEN_CLIENT_LOGGING)..."
 client_logging_cmd="cd '$CLIENT_SETUP_DIR'; sudo bash record-host-metrics.sh \
     --dep '$CLIENT_HOME' -o '${EXP_NAME}-RUN-${j}' --dur '$CORE_DURATION_S' \
-    --cpu-util 1 -c '$CLIENT_CPU_MASK' --retx 1 --tcplog 0 --bw 1 --flame 0 \
-    --pcie 0 --membw 0 --iio 0 --pfc 0 --intf '$CLIENT_INTF' --type 0; exec bash"
-$SSH_CLIENT_CMD "screen -dmS $SCREEN_CLIENT_LOGGING sudo bash -c \"$client_logging_cmd\""
+    --cpu-util 1 -c '$CLIENT_CPU_MASK' --retx 1 --tcplog 0 --bw 0 --flame 0 \
+    --pcie 0 --membw 0 --iio 0 --pfc 0 --intf '$CLIENT_INTF' --type 0"
+$SSH_CLIENT_CMD "$client_logging_cmd" &
+client_logging_pid=$!
 
 # --- Start Guest-side (Server) Logging ---
 log_info "Starting GUEST-side (server) logging..."
 cd "$GUEST_SETUP_DIR" || { log_error "Failed to cd to $GUEST_SETUP_DIR"; exit 1; }
 sudo bash record-host-metrics.sh --dep "$GUEST_HOME" -o "${EXP_NAME}-RUN-${j}" \
-	--dur "$CORE_DURATION_S" --cpu-util 1 -c "$GUEST_CPU_MASK" --retx 1 --tcplog 0 --bw 1 --flame 0 \
+	--dur "$CORE_DURATION_S" --cpu-util 1 -c "$GUEST_CPU_MASK" --retx 1 --tcplog 0 --bw 1 --expected-flows "$GUEST_NUM_SERVERS" --flame 0 \
 	--pcie 0 --membw 0 --iio 0 --pfc 0 --intf "$GUEST_INTF" --type 0
 cd - > /dev/null
 
+multi_vm_check_traffic || exit 1
 log_info "Logging done."
 log_info "Primary data collection phase on GUEST complete."
 
 # --- Save Guest Ftrace Data ---
-log_info "Stopping and saving GUEST ftrace data..."
-sudo sh -c 'echo 0 > /sys/kernel/debug/tracing/tracing_on'
-sudo cat /sys/kernel/debug/tracing/trace > "$iova_ftrace_guest_output_file"
-sudo sh -c 'echo > /sys/kernel/debug/tracing/trace'
-log_info "GUEST ftrace data saved to $iova_ftrace_guest_output_file"
-
-head -n 2000 "$iova_ftrace_guest_output_file" > "${iova_ftrace_guest_output_file}.head2000"
-tail -n 2000 "$iova_ftrace_guest_output_file" > "${iova_ftrace_guest_output_file}.tail2000"
 
 # --- Stop Guest eBPF Tracers ---
 if [ "$EBPF_TRACING_ENABLED" -eq 1 ]; then
@@ -624,6 +595,8 @@ fi
 
 # --- Transfer Report Files from Client ---
 # Files on the client are in a dir named after EXP_NAME (already VM-specific).
+# The SSH child returns the actual collector status; screen launch success did not.
+wait "$client_logging_pid" || { log_error "Client metrics collector failed"; exit 1; }
 log_info "Transferring report files from CLIENT..."
 if [ "$CLIENT_USE_PASS_AUTH" -eq 1 ]; then
 	sshpass -p "$CLIENT_SSH_PASSWORD" \
@@ -641,8 +614,6 @@ else
 		"$client_app_log_file" || log_error "Failed to SCP client_app.log"
 fi
 
-log_info "Waiting for remote operations to settle ($((CORE_DURATION_S * 2))s)..."
-progress_bar $((CORE_DURATION_S * 2)) 2
 
 log_info "############################################################"
 log_info "### Finished Experiment: $EXP_NAME (vm${VM_ID})"
@@ -650,6 +621,7 @@ log_info "############################################################"
 
 # --- Post-run cleanup ---
 cleanup
+trap - EXIT
 
 # Decode before the host destroys the guest, while its symbols are available.
 if [ "$PERF_TRACING_ENABLED" -eq 1 ]; then
@@ -660,21 +632,14 @@ if [ "$PERF_TRACING_HOST_ENABLED" -eq 1 ]; then
     $SSH_HOST_CMD "sudo bash -c \"'$HOST_PERF' script -i '$perf_host_data_file_remote' >'$host_reports_dir_remote/perf_host_cpu.stacks' 2>>'$host_reports_dir_remote/perf_host_record.log' && chmod a+r '$perf_host_data_file_remote'\"" || exit 1
 fi
 
-post_exp_cleanup
 
 cd "$SCRIPT_DIR" || exit 1
-
-sleep 5
 
 if [ "$MLC_CORES" != "none" ]; then
 	log_info "MLC cores were used."
 fi
 
 log_info "Collecting and processing statistics..."
-if [ "$MLC_CORES" = "none" ]; then
-	sudo python3 many-vm-collect-tput-stats.py "$EXP_NAME" "$NUM_RUNS" 0
-else
-	sudo python3 many-vm-collect-tput-stats.py "$EXP_NAME" "$NUM_RUNS" 0
-fi
+sudo python3 many-vm-collect-tput-stats.py "$EXP_NAME" "$NUM_RUNS" 0
 
 log_info "Experiment $EXP_NAME (vm${VM_ID}) finished."

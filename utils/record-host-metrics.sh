@@ -1,3 +1,4 @@
+set -euo pipefail
 #default values
 SCRIPT_NAME="record-host-metrics"
 
@@ -12,6 +13,7 @@ TCP_LOG_REPORTING=0
 FLAMEGRAPH_REPORTING=0
 PERCORE_FLAMEGRAPH=1
 BANDWIDTH_REPORTING=1
+EXPECTED_FLOWS=0
 PCIE_REPORTING=1
 MEMBW_REPORTING=1
 IIO_REPORTING=0
@@ -32,7 +34,8 @@ help()
                [ -c | --cores (comma separated values of cpu cores to log utilization, eg., '0,4,8,12') ) ] 
                [ --retx (=0/1, disable/enable recording retransmission rate (should be done at TCP senders) ) ] 
                [ --tcplog (=0/1, disable/enable recording TCP log (should be done at TCP senders) ) ] 
-               [ --bw (=0/1, disable/enable recording app-level bandwidth ) ] 
+               [ --bw (=0/1, disable/enable recording app-level bandwidth ) ]
+               [ --expected-flows N (require all N flow logs and the full throughput window) ]
                [ -f | --flame (=0/1, disable/enable recording flamegraph (for cores specified via -C/--cores option) ) ] 
                [ --percore-flame (=0/1, disable/enable per-core flamegraph breakdown (requires --flame=1) ) ] 
                [ --pcie (=0/1, disable/enable recording PCIe bandwidth) ] 
@@ -46,7 +49,7 @@ help()
 }
 
 SHORT=o:,c:,f:,t:,h
-LONG=dep:,outdir:,dur:,cpu-util:,cores:,retx:,tcplog:,bw:,flame:,percore-flame:,pcie:,membw:,iio:,pfc:,intf:,type:,help
+LONG=dep:,outdir:,dur:,cpu-util:,cores:,retx:,tcplog:,bw:,expected-flows:,flame:,percore-flame:,pcie:,membw:,iio:,pfc:,intf:,type:,help
 OPTS=$(getopt -a -n $SCRIPT_NAME --options $SHORT --longoptions $LONG -- "$@")
 
 VALID_ARGUMENTS=$# # Returns the count of arguments that are in short or long options
@@ -66,6 +69,7 @@ while :; do
     --retx) RETX_REPORTING="$2"; shift 2 ;;
     --tcplog) TCP_LOG_REPORTING="$2"; shift 2 ;;
     --bw) BANDWIDTH_REPORTING="$2"; shift 2 ;;
+    --expected-flows) EXPECTED_FLOWS="$2"; shift 2 ;;
     -f | --flame) FLAMEGRAPH_REPORTING="$2"; shift 2 ;;
     --percore-flame) PERCORE_FLAMEGRAPH="$2"; shift 2 ;;
     --pcie) PCIE_REPORTING="$2"; shift 2 ;;
@@ -252,17 +256,41 @@ function compile_if_needed() {
 if [ "$TYPE" -eq 0 ]; then
     echo "Collecting TCP experiment metrics..."
 
+    if [[ "$EXPECTED_FLOWS" -gt 0 && "$BANDWIDTH_REPORTING" -eq 1 ]]; then
+        rm -f "reports/$OUT_DIR/iperf.bw.rpt"
+    fi
+    bw_offsets="{}"
+    if [[ "$BANDWIDTH_REPORTING" -eq 1 ]]; then
+        bw_offsets=$(python3 - "logs/$OUT_DIR" "$EXPECTED_FLOWS" <<'IPERF_OFFSETS'
+import json,sys
+from pathlib import Path
+directory, expected = Path(sys.argv[1]), int(sys.argv[2])
+files = list(directory.glob('iperf.bw.*.log'))
+if expected and {p.name for p in files} != {f'iperf.bw.{i}.log' for i in range(expected)}:
+    raise SystemExit(f'Expected {expected} flow logs in {directory}; found {len(files)}')
+print(json.dumps({str(p.resolve()):p.stat().st_size for p in files}))
+IPERF_OFFSETS
+)
+    fi
+
     if [ "$CPU_UTIL_REPORTING" -eq 1 ]; then
       echo "Collecting CPU utilization for cores $CPU_MASK..." 
-      sar -P $CPU_MASK 1 1000 > logs/$OUT_DIR/cpu_util.log &
-      sleep $DURATION_S
-      sudo pkill -9 -f "sar"
+      sar -P "$CPU_MASK" 1 "$DURATION_S" > "logs/$OUT_DIR/cpu_util.log" &
+      sar_pid=$!
+      trap 'kill "$sar_pid" 2>/dev/null || true' EXIT
+      wait "$sar_pid"
+      trap - EXIT
       python3 cpu_util.py logs/$OUT_DIR/cpu_util.log > reports/$OUT_DIR/cpu_util.rpt
     fi
 
-    if [ "$BANDWIDTH_REPORTING" -eq 1 ]; then
-      echo "Collecting app bandwidth... (no op)"
-      # echo "Avg_iperf_tput: " $(cat logs/$OUT_DIR/iperf.bw.log | grep "60.*-90.*" | awk  '{ sum += $7; n++ } END { if (n > 0) printf "%.3f", sum/1000; }') > reports/$OUT_DIR/iperf.bw.rpt
+    if [[ "$BANDWIDTH_REPORTING" -eq 1 && "$bw_offsets" != "{}" ]]; then
+        [[ "$CPU_UTIL_REPORTING" -eq 1 ]] || sleep "$DURATION_S"
+        # The existing parser runs from scripts/, as in the original TX runner.
+        if [[ "$EXPECTED_FLOWS" -gt 0 ]]; then
+            (cd ../scripts && bash collect-period-tput.sh "$OUT_DIR" "$bw_offsets" "$DURATION_S" "$EXPECTED_FLOWS")
+        else
+            (cd ../scripts && bash collect-period-tput.sh "$OUT_DIR" "$bw_offsets")
+        fi
     fi
 
     if [ "$RETX_REPORTING" -eq 1 ]; then
