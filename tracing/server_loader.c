@@ -402,21 +402,22 @@ static void dump_aggregate_to_file(FILE *fp, struct server_tracer_bpf *skel)
   }
 }
 
-static int kernel_has_symbol(const char *target)
+static int find_available_probes(int *available)
 {
   FILE *fp = fopen("/proc/kallsyms", "r");
   char line[1024], name[512], type;
   unsigned long long address;
   if (!fp) return -1;
   while (fgets(line, sizeof(line), fp)) {
-    if (sscanf(line, "%llx %c %511s", &address, &type, name) == 3 &&
-        strcmp(name, target) == 0) {
-      fclose(fp);
-      return 1;
-    }
+    if (sscanf(line, "%llx %c %511s", &address, &type, name) != 3)
+      continue;
+    for (int i = 0; i < num_probes_to_attach; i++)
+      if (strcmp(name, probes_to_attach[i].target_name) == 0)
+        available[i] = 1;
   }
+  int err = ferror(fp) ? -1 : 0;
   fclose(fp);
-  return 0;
+  return err;
 }
 
 int main(int argc, char **argv)
@@ -454,16 +455,16 @@ int main(int argc, char **argv)
 
   printf("Attaching probes... time=%ld\n", time(NULL));
   int n_skipped = 0;
+  int available[sizeof(probes_to_attach) / sizeof(probes_to_attach[0])] = {0};
+  if (find_available_probes(available) < 0) {
+    perror("Cannot read /proc/kallsyms");
+    err = -EACCES;
+    goto cleanup_file;
+  }
   for (int i = 0; i < num_probes_to_attach; i++)
   {
     probe_def_t *p_def = &probes_to_attach[i];
-    int available = kernel_has_symbol(p_def->target_name);
-    if (available < 0) {
-      perror("Cannot read /proc/kallsyms");
-      err = -EACCES;
-      goto cleanup_file;
-    }
-    if (!available) {
+    if (!available[i]) {
       printf("Unavailable on this kernel: %s (%s)\n", p_def->target_name, p_def->bpf_prog_name);
       n_skipped++;
       continue;

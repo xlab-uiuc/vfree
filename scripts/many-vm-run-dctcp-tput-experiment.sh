@@ -540,7 +540,7 @@ if [[ "$EBPF_TRACING_HOST_ENABLED" -eq 1 ]]; then
 fi
 if [[ "$EBPF_TRACING_ENABLED" -eq 1 ]]; then
     log_info "Starting GUEST eBPF tracer..."
-    sudo -n taskset -c 0 "$EBPF_GUEST_LOADER" -d "$CORE_DURATION_S" -o "$ebpf_guest_stats" \
+    sudo -n "$EBPF_GUEST_LOADER" -d "$CORE_DURATION_S" -o "$ebpf_guest_stats" \
         >"${current_guest_reports_dir}/ebpf_guest_record.log" 2>&1 &
     guest_ebpf_pid=$!
 fi
@@ -555,14 +555,14 @@ log_info "Guest ftrace disabled (perf sampling is a separate option)."
 # --- Start Main Profiling & Logging Phase ---
 if [ "$PERF_TRACING_ENABLED" -eq 1 ]; then
     log_info "Starting GUEST perf record (CPU profiling)..."
-    sudo "$GUEST_PERF" record -F 99 -a -g --call-graph dwarf -o "$perf_guest_data_file" -- sleep "$PROFILING_LOGGING_DUR_S" \
+    sudo "$GUEST_PERF" record -F 99 -m 8M -a -g --call-graph dwarf -o "$perf_guest_data_file" -- sleep "$PROFILING_LOGGING_DUR_S" \
         >"${current_guest_reports_dir}/perf_guest_record.log" 2>&1 &
     guest_perf_pid=$!
 fi
 
 if [ "$PERF_TRACING_HOST_ENABLED" -eq 1 ]; then
     log_info "Starting HOST perf record (CPU profiling) on $HOST_IP..."
-    $SSH_HOST_CMD "mkdir -p '$host_reports_dir_remote' && exec sudo -n '$HOST_PERF' record -F 99 -a -g --call-graph dwarf -o '$perf_host_data_file_remote' -- sleep '$PROFILING_LOGGING_DUR_S' >'$host_reports_dir_remote/perf_host_record.log' 2>&1" &
+    $SSH_HOST_CMD "mkdir -p '$host_reports_dir_remote' && exec sudo -n '$HOST_PERF' record -F 99 -m 8M -a -g --call-graph dwarf -o '$perf_host_data_file_remote' -- sleep '$PROFILING_LOGGING_DUR_S' >'$host_reports_dir_remote/perf_host_record.log' 2>&1" &
     host_perf_pid=$!
 fi
 
