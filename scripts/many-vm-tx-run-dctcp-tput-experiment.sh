@@ -7,7 +7,7 @@ set -euo pipefail
 # CONFIGURATION AND PATHS
 #-------------------------------------------------------------------------------
 SCRIPT_NAME="run-rdma-tput-experiment"
-INIT_PORT=3000
+INIT_PORT=20000
 MLC_DURATION_S=100
 GUEST_MLC_DIR_REL="mlc/Linux"
 
@@ -212,7 +212,8 @@ NUM_RUNS=1
 # Port offset avoids any potential conflicts on the client side.
 SCREEN_CLIENT_SESSION="client_session_vm${VM_ID}"
 SCREEN_CLIENT_LOGGING="logging_session_client_vm${VM_ID}"
-INIT_PORT=$((3000 + VM_ID * 100))
+# Keep receivers clear of nexus03 services such as FastX on port 3300.
+INIT_PORT=$((INIT_PORT + VM_ID * 100))
 
 # Only trace on vm0
 if [ "$VM_ID" -ne 0 ]; then
