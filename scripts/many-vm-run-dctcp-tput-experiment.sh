@@ -15,6 +15,10 @@ PERF_TRACING_ENABLED=0
 PERF_TRACING_HOST_ENABLED=0
 SYNC_DIR=""
 traffic_pids=()
+guest_perf_pid=""
+host_perf_pid=""
+guest_ebpf_pid=""
+host_ebpf_pid=""
 
 # --- Base Directory Paths (Relative to respective home directories) ---
 SCRIPT_DIR=$(dirname "$0")
@@ -124,7 +128,8 @@ help() {
 	echo "    [ --socket-buf <MB> (TCP socket buffer size in MB; default: 1) ]"
 	echo "    [ --dur <seconds> (Core experiment duration in seconds; default: 20) ]"
 	echo "    [ --runs <count> (Number of experiment repetitions; forced to 1 for multi-VM) ]"
-	echo "    [ --ebpf-tracing <0|1> (Enable eBPF tracing; default: 0) ]"
+	echo "    [ --ebpf-tracing <0|1> (Enable guest eBPF tracing; default: 0) ]"
+	echo "    [ --ebpf-host-tracing <0|1> (Enable host eBPF tracing from VM0; default: 0) ]"
 	echo "    [ --mem-stats <0|1> (Enable collect-mem-stats.sh; default: 0) ]"
 	echo
 	echo "Client SSH Configuration:"
@@ -146,7 +151,7 @@ SHORT_OPTS="n:c:N:C:e:m:d:b:r:h"
 LONG_OPTS="guest-home:,guest-ip:,guest-intf:,guest-bus:,guest-num:,guest-cpu-mask:,\
 client-home:,client-ip:,client-intf:,client-num:,client-cpu-mask:,\
 host-home:,host-results-dir:,host-ip:,host-ssh-name:,perf-tracing:,perf-host-tracing:,sync-dir:,\
-vm-id:,exp-name:,mtu:,ddio:,bandwidth:,ring-buffer:,mlc-cores:,socket-buf:,dur:,runs:,ebpf-tracing:,mem-stats:,\
+vm-id:,exp-name:,mtu:,ddio:,bandwidth:,ring-buffer:,mlc-cores:,socket-buf:,dur:,runs:,ebpf-tracing:,ebpf-host-tracing:,mem-stats:,\
 client-ssh-name:,client-ssh-host:,client-ssh-use-pass:,client-ssh-pass:,client-ssh-ifile:,help"
 
 PARSED_OPTS=$(getopt -a -n "$SCRIPT_NAME" --options "$SHORT_OPTS" --longoptions "$LONG_OPTS" -- "$@")
@@ -187,6 +192,7 @@ while :; do
 	--dur) CORE_DURATION_S="$2"; shift 2 ;;
 	--runs) NUM_RUNS="$2"; shift 2 ;;
 	--ebpf-tracing) EBPF_TRACING_ENABLED="$2"; shift 2 ;;
+	--ebpf-host-tracing) EBPF_TRACING_HOST_ENABLED="$2"; shift 2 ;;
 	--mem-stats) COLLECT_MEM_STATS="$2"; shift 2 ;;
 	--client-ssh-name) CLIENT_SSH_UNAME="$2"; shift 2 ;;
 	--client-ssh-host) CLIENT_SSH_HOST="$2"; shift 2 ;;
@@ -209,11 +215,10 @@ SCREEN_CLIENT_SESSION="client_session_vm${VM_ID}"
 SCREEN_CLIENT_LOGGING="logging_session_client_vm${VM_ID}"
 INIT_PORT=$((3000 + VM_ID * 100))
 
-# Only trace on vm0
+# Only VM0 owns host-wide recorders
 if [ "$VM_ID" -ne 0 ]; then
 	PERF_TRACING_HOST_ENABLED=0
   EBPF_TRACING_HOST_ENABLED=0
-	EBPF_TRACING_ENABLED=0 
 fi
 
 GUEST_SETUP_DIR="${GUEST_HOME}/${GUEST_FandS_REL}/${GUEST_SETUP_DIR_REL}"
@@ -333,19 +338,14 @@ cleanup() {
 	if [ "$EBPF_TRACING_ENABLED" -eq 1 ]; then
 		log_info "Stopping guest eBPF tracers..."
 		guest_loader_basename=$(basename "$EBPF_GUEST_LOADER")
-		cd "$(dirname "$EBPF_GUEST_LOADER")" || { log_error "Failed to cd to $(dirname "$EBPF_GUEST_LOADER")"; }
-		make clean 2>/dev/null || true
-		make 2>/dev/null || true
-		cd - > /dev/null
-		sudo pkill -SIGINT -f "$guest_loader_basename" 2>/dev/null || true
-		sudo pkill -9 -f "$guest_loader_basename" 2>/dev/null || true
+
+		sudo pkill -SIGINT -x "$guest_loader_basename" 2>/dev/null || true
+		sudo pkill -9 -x "$guest_loader_basename" 2>/dev/null || true
 	fi
 	if [ "$EBPF_TRACING_HOST_ENABLED" -eq 1 ]; then
-	    local host_loader_basename
-      host_loader_basename=$(basename "$EBPF_HOST_LOADER")
-      $SSH_HOST_CMD \
-      "sudo pkill -SIGINT -f '$host_loader_basename'; sleep 5; sudo pkill -9 -f '$host_loader_basename'; screen -S ebpf_host_tracer -X quit || true"
-  fi
+        $SSH_HOST_CMD "sudo -n pkill -SIGINT -x server_loader || true" || true
+    fi
+
 	# sleep 5
 
 
@@ -459,6 +459,14 @@ cleanup
 trap cleanup EXIT
 trap 'exit 1' HUP INT TERM
 
+# Build enabled tracers before warmup, never during cleanup or measurement.
+if [[ "$EBPF_TRACING_ENABLED" -eq 1 ]]; then
+    make -C "$(dirname "$EBPF_GUEST_LOADER")" guest
+fi
+if [[ "$EBPF_TRACING_HOST_ENABLED" -eq 1 ]]; then
+    $SSH_HOST_CMD "make -C '$(dirname "$EBPF_HOST_LOADER")' server"
+fi
+
 # --- Save config ---
 save_config_to_report_json "$current_guest_reports_dir"
 
@@ -525,18 +533,16 @@ multi_vm_wait_for_signal measure || exit 1
 multi_vm_check_traffic || exit 1
 
 
-if [ "$EBPF_TRACING_HOST_ENABLED" -eq 1 ]; then
-    log_info "Starting HOST eBPF tracer on $HOST_IP..."
-    host_loader_cmd="sudo taskset -c 33 $EBPF_HOST_LOADER -o $ebpf_host_stats"
-    $SSH_HOST_CMD "screen -dmS ebpf_host_tracer sudo bash -c \"$host_loader_cmd\""
+if [[ "$EBPF_TRACING_HOST_ENABLED" -eq 1 ]]; then
+    log_info "Starting HOST eBPF tracer..."
+    $SSH_HOST_CMD "mkdir -p '$host_reports_dir_remote' && exec sudo -n taskset -c 33 '$EBPF_HOST_LOADER' -d '$CORE_DURATION_S' -o '$ebpf_host_stats' >'$host_reports_dir_remote/ebpf_host_record.log' 2>&1" &
+    host_ebpf_pid=$!
 fi
-# sleep 4 # Allow eBPF loaders to initialize
-
-# --- Start Guest eBPF Tracers (if enabled) ---
-if [ "$EBPF_TRACING_ENABLED" -eq 1 ]; then
-	log_info "Starting GUEST eBPF tracer..."
-	echo "current_time: $(date) $(date +%s)"
-	sudo taskset -c 0 "$EBPF_GUEST_LOADER" -d "$CORE_DURATION_S" -o "$ebpf_guest_stats" &
+if [[ "$EBPF_TRACING_ENABLED" -eq 1 ]]; then
+    log_info "Starting GUEST eBPF tracer..."
+    sudo -n taskset -c 0 "$EBPF_GUEST_LOADER" -d "$CORE_DURATION_S" -o "$ebpf_guest_stats" \
+        >"${current_guest_reports_dir}/ebpf_guest_record.log" 2>&1 &
+    guest_ebpf_pid=$!
 fi
 
 # Sleep outside so all VMs nearly in sync
@@ -551,12 +557,13 @@ if [ "$PERF_TRACING_ENABLED" -eq 1 ]; then
     log_info "Starting GUEST perf record (CPU profiling)..."
     sudo "$GUEST_PERF" record -F 99 -a -g --call-graph dwarf -o "$perf_guest_data_file" -- sleep "$PROFILING_LOGGING_DUR_S" \
         >"${current_guest_reports_dir}/perf_guest_record.log" 2>&1 &
+    guest_perf_pid=$!
 fi
 
 if [ "$PERF_TRACING_HOST_ENABLED" -eq 1 ]; then
     log_info "Starting HOST perf record (CPU profiling) on $HOST_IP..."
-    host_perf_cmd="mkdir -p '$host_reports_dir_remote'; '$HOST_PERF' record -F 99 -a -g --call-graph dwarf -o '$perf_host_data_file_remote' -- sleep '$PROFILING_LOGGING_DUR_S' >'$host_reports_dir_remote/perf_host_record.log' 2>&1"
-    $SSH_HOST_CMD "screen -dmS perf_screen sudo bash -c \"$host_perf_cmd\""
+    $SSH_HOST_CMD "mkdir -p '$host_reports_dir_remote' && exec sudo -n '$HOST_PERF' record -F 99 -a -g --call-graph dwarf -o '$perf_host_data_file_remote' -- sleep '$PROFILING_LOGGING_DUR_S' >'$host_reports_dir_remote/perf_host_record.log' 2>&1" &
+    host_perf_pid=$!
 fi
 
 # --- Start Client-side Logging (VM-specific screen session + output dir) ---
@@ -582,19 +589,14 @@ log_info "Primary data collection phase on GUEST complete."
 
 # --- Save Guest Ftrace Data ---
 
-# --- Stop Guest eBPF Tracers ---
-if [ "$EBPF_TRACING_ENABLED" -eq 1 ]; then
-	log_info "Stopping guest eBPF tracers..."
-	echo "current_time: $(date) $(date +%s)"
-	guest_loader_basename=$(basename "$EBPF_GUEST_LOADER")
-	sudo pkill -SIGINT -f "$guest_loader_basename" 2>/dev/null && \
-		log_info "SIGINT sent to GUEST eBPF loader." || \
-		log_info "WARN: GUEST eBPF loader process not found or SIGINT failed."
-fi
-if [ "$EBPF_TRACING_HOST_ENABLED" -eq 1 ]; then
-    host_loader_basename=$(basename "$EBPF_HOST_LOADER")
-    $SSH_HOST_CMD "sudo pkill -SIGINT -f '$host_loader_basename'"
-fi
+# Each recorder must finish successfully before its output is accepted.
+for recorder in guest_perf_pid host_perf_pid guest_ebpf_pid host_ebpf_pid; do
+    pid=${!recorder}
+    if [[ -n "$pid" ]] && ! wait "$pid"; then
+        log_error "$recorder failed; inspect its recording log"
+        exit 1
+    fi
+done
 
 # --- Transfer Report Files from Client ---
 # Files on the client are in a dir named after EXP_NAME (already VM-specific).

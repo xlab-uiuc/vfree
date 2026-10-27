@@ -15,7 +15,8 @@ NUM_ACTIVE_CORES="12"
 NUM_FLOWS="12"
 REUSE=0
 SKIP_RESET_HOST=0
-PERF_TRACING="off" # off/vm0/all; one host recording whenever enabled
+PERF_TRACING="${PERF_TRACING:-off}" # off/vm0/all; one host recording whenever enabled
+EBPF_TRACING="${EBPF_TRACING:-off}" # RX: off, vm0, all (one host tracer)
 RECORD_COUNTERS=off # optional NIC/IIO diagnostics
 MEASUREMENT_DURATION=20
 COUNTER_INTERVAL=1
@@ -112,6 +113,7 @@ usage() {
 	  --skip-reset-host   Skip host reset (host setup will still run)
 	  --boot-timeout N    Seconds to wait for SSH per VM (default: $BOOT_TIMEOUT)
 	  --perf-tracing MODE Record host and selected guests: off, vm0, all (default: off)
+	  --ebpf-tracing MODE RX host and selected guests: off, vm0, all (default: off)
 	  --record-counters MODE Optional NIC/IIO diagnostics: on or off (default: off)
 	  --duration N       Main measurement duration in seconds (default: 20)
 	  --counter-interval N Counter sampling interval in seconds (default: 1)
@@ -138,6 +140,7 @@ while [[ $# -gt 0 ]]; do
 	--skip-reset-host)  SKIP_RESET_HOST=1; shift   ;;
 	--boot-timeout)  BOOT_TIMEOUT="$2"; shift 2 ;;
 	--perf-tracing)  PERF_TRACING="$2"; shift 2 ;;
+	--ebpf-tracing) EBPF_TRACING="$2"; shift 2 ;;
 	--record-counters) RECORD_COUNTERS="$2"; shift 2 ;;
 	--duration) MEASUREMENT_DURATION="$2"; shift 2 ;;
 	--counter-interval) COUNTER_INTERVAL="$2"; shift 2 ;;
@@ -162,6 +165,14 @@ case "$PERF_TRACING" in
 off|vm0|all) ;;
 *) echo "Error: --perf-tracing must be off, vm0, or all" >&2; exit 1 ;;
 esac
+
+case "$EBPF_TRACING" in
+off|vm0|all) ;;
+*) echo "Error: --ebpf-tracing must be off, vm0, or all" >&2; exit 1 ;;
+esac
+if [[ "$EBPF_TRACING" != off && "$traffic_direction" != RX ]]; then
+    echo "Error: --ebpf-tracing is currently supported for RX" >&2; exit 1
+fi
 
 case "$RECORD_COUNTERS" in
 on|off) ;;
@@ -453,7 +464,7 @@ finish_run() {
 	if [[ -n "$RESULT_FILE" ]]; then
 		if ! python3 - "$RESULT_FILE" "$run_rc" "$EXP_NAME" "$HOST_RESULTS_DIR" \
 			"$GUEST_VIOMMU" "$NUM_VMS" "$NUM_TOTAL_CORES" "$NUM_ACTIVE_CORES" "$NUM_FLOWS" \
-			"$MEASUREMENT_DURATION" "$COUNTER_INTERVAL" "$RECORD_COUNTERS" "$PERF_TRACING" \
+			"$MEASUREMENT_DURATION" "$COUNTER_INTERVAL" "$RECORD_COUNTERS" "$PERF_TRACING" "$EBPF_TRACING" \
 			"$RUN_LABEL" "${traffic_direction:-unknown}" "$GUEST_KERNEL" "${vm_names[@]}" <<'RESULT'
 import json
 import platform
@@ -461,7 +472,7 @@ from pathlib import Path
 import sys
 
 (destination, rc, experiment, reports, viommu, num_vms, total, active, flows,
- duration, interval, counters, perf, label, direction, guest_kernel, *vm_names) = sys.argv[1:]
+ duration, interval, counters, perf, ebpf, label, direction, guest_kernel, *vm_names) = sys.argv[1:]
 report = (Path(reports) / experiment).resolve() if experiment else None
 result = dict(schema_version=2, measurement_basis="synchronized-iperf", status='complete' if int(rc) == 0 else 'failed',
               exit_code=int(rc), experiment=experiment, report_directory=str(report) if report else None,
@@ -469,7 +480,7 @@ result = dict(schema_version=2, measurement_basis="synchronized-iperf", status='
               configuration=dict(measurement_basis="synchronized-iperf", viommu=viommu, num_vms=int(num_vms), total_cores=int(total),
                                  active_cores=int(active), flows=int(flows), direction=direction,
                                  duration_s=int(duration), interval_s=int(interval),
-                                 record_counters=counters, perf_tracing=perf, host_kernel=platform.release(),
+                                 record_counters=counters, perf_tracing=perf, ebpf_tracing=ebpf, host_kernel=platform.release(),
                                  guest_kernel=guest_kernel))
 if report:
     report.mkdir(parents=True, exist_ok=True)
@@ -824,11 +835,20 @@ for ((i = 0; i < NUM_VMS; i++)); do
 		perf_host=1
 	fi
 
+	ebpf_guest=0
+	ebpf_host=0
+	if [[ "$EBPF_TRACING" == all || ( "$EBPF_TRACING" == vm0 && "$i" -eq 0 ) ]]; then
+		ebpf_guest=1
+	fi
+	if [[ "$EBPF_TRACING" != off && "$i" -eq 0 ]]; then
+		ebpf_host=1
+	fi
+
 	vm_cmd="${VM_SCRIPT} --vm-name ${name} --num-cores ${NUM_ACTIVE_CORES} --num-flows ${NUM_FLOWS} \
 		--exp-name ${EXP_NAME}-${name} \
 		--host-ip ${HOST_IP} --host-ssh-uname ${HOST_SSH_UNAME} \
 		--host-home ${HOST_HOME} --host-results-dir ${HOST_RESULTS_DIR} \
-		--perf-tracing ${perf_guest} --perf-host-tracing ${perf_host} --duration ${MEASUREMENT_DURATION} --sync-dir ${SYNC_DIR}"
+		--perf-tracing ${perf_guest} --perf-host-tracing ${perf_host} --ebpf-tracing ${ebpf_guest} --ebpf-host-tracing ${ebpf_host} --duration ${MEASUREMENT_DURATION} --sync-dir ${SYNC_DIR}"
 	ssh $SSH_OPTS "$SSH_USER@$ip" "$vm_cmd" &>"$LOG_DIR/host-${name}_experiment.log" &
 	ssh_pids+=($!)
 	echo "  Launched on ${name} (${ip}), log -> $LOG_DIR/host-${name}_experiment.log"

@@ -437,6 +437,23 @@ static void dump_aggregate_to_file(FILE *fp, struct guest_tracer_bpf *skel)
   }
 }
 
+static int kernel_has_symbol(const char *target)
+{
+  FILE *fp = fopen("/proc/kallsyms", "r");
+  char line[1024], name[512], type;
+  unsigned long long address;
+  if (!fp) return -1;
+  while (fgets(line, sizeof(line), fp)) {
+    if (sscanf(line, "%llx %c %511s", &address, &type, name) == 3 &&
+        strcmp(name, target) == 0) {
+      fclose(fp);
+      return 1;
+    }
+  }
+  fclose(fp);
+  return 0;
+}
+
 int main(int argc, char **argv)
 {
   struct guest_tracer_bpf *skel = NULL;
@@ -471,10 +488,21 @@ int main(int argc, char **argv)
   }
 
   printf("Attaching probes... time=%ld\n", time(NULL));
-  int n_failed = 0;
+  int n_skipped = 0;
   for (int i = 0; i < num_probes_to_attach; i++)
   {
     probe_def_t *p_def = &probes_to_attach[i];
+    int available = kernel_has_symbol(p_def->target_name);
+    if (available < 0) {
+      perror("Cannot read /proc/kallsyms");
+      err = -EACCES;
+      goto cleanup_file;
+    }
+    if (!available) {
+      printf("Unavailable on this kernel: %s (%s)\n", p_def->target_name, p_def->bpf_prog_name);
+      n_skipped++;
+      continue;
+    }
     struct bpf_program *prog = bpf_object__find_program_by_name(skel->obj, p_def->bpf_prog_name);
     if (!prog)
     {
@@ -497,20 +525,22 @@ int main(int argc, char **argv)
 
     if (!link || libbpf_get_error(link))
     {
-      err = libbpf_get_error(link);
+      err = link ? libbpf_get_error(link) : -errno;
+      if (!err) err = -EINVAL;
       fprintf(stderr, "Failed to attach %s '%s' to '%s': %s\n",
               p_def->type == PROBE_TYPE_KPROBE ? "kprobe" : "kretprobe",
               p_def->bpf_prog_name, p_def->target_name, strerror(-err));
-      // goto cleanup_file;
-      n_failed++;
+      goto cleanup_file;
     }
     attached_links[attached_count++] = link;
   }
 
-  if (n_failed > 0) {
-    printf("[WARN] %d probes failed to attach. time=%ld\n", n_failed, time(NULL));
-  } else {
-    printf("All %d probes attached successfully. time=%ld\n", attached_count, time(NULL));
+  printf("Attached %d probes; %d unavailable on this kernel. time=%ld\n",
+         attached_count, n_skipped, time(NULL));
+  if (!attached_count) {
+    fprintf(stderr, "No probes attached\n");
+    err = -ENOENT;
+    goto cleanup_file;
   }
 
   signal(SIGINT, sig_handler);
