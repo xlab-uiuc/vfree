@@ -340,12 +340,12 @@ wait_for_nic() {
 	local ip=$1
 	local name=$2
 
-	if ssh $SSH_OPTS "$SSH_USER@$ip" "ip link show $GUEST_NIC" &>/dev/null; then
-		echo "  ${name} (${ip}): $GUEST_NIC already up"
+	if ssh $SSH_OPTS "$SSH_USER@$ip" "ip link show $GUEST_NIC && sudo -n modprobe tcp_dctcp" &>/dev/null; then
+		echo "  ${name} (${ip}): $GUEST_NIC and DCTCP ready"
 		return 0
 	fi
 
-	echo "  ${name} (${ip}): $GUEST_NIC not found, pushing in-tree mlx5 modules..."
+	echo "  ${name} (${ip}): NIC or DCTCP module missing, installing guest modules..."
 	scp $SSH_OPTS /tmp/modules.tar.gz "$SSH_USER@$ip:/tmp/" &>/dev/null || return 1
 
 	ssh $SSH_OPTS "$SSH_USER@$ip" "
@@ -359,6 +359,7 @@ wait_for_nic() {
 		           /lib/modules/\$(uname -r)/updates/dkms/mlxdevm.ko
 		sudo depmod -a 2>/dev/null
 		sudo modprobe mlx5_core 2>/dev/null
+		sudo modprobe tcp_dctcp 2>/dev/null
 	" &>/dev/null || return 1
 
 	local elapsed=0
