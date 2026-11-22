@@ -54,6 +54,7 @@ EBPF_TRACING_ENABLED=1 #test
 GUEST_EBPF_TRACING_CORE=30
 EBPF_TRACING_HOST_ENABLED=0
 COLLECT_MEM_STATS=0
+APP="iperf" # iperf: iperf3 flows (main figures); zc: zc_tput with MSG_ZEROCOPY sends from the guest
 
 # --- Guest (Server) Machine Configuration ---
 GUEST_HOME="/home/schai"
@@ -127,6 +128,7 @@ help() {
     echo "    [ --runs <count> (Number of experiment repetitions; default: 1) ]"
     echo "    [ --ebpf-tracing <0|1> (Enable eBPF tracing; default: 0) ]"
     echo "    [ --mem-stats <0|1> (Enable collect-mem-stats.sh; default: 1) ]"
+    echo "    [ --app <iperf|zc> (Workload: iperf3, or zc_tput MSG_ZEROCOPY sends from the guest; default: iperf) ]"
     echo
      echo "Client SSH Configuration"
     echo "    [ --client-ssh-name <uname> (SSH username for client) ]"
@@ -147,7 +149,7 @@ SHORT_OPTS="n:c:N:C:e:m:d:b:r:h"
 LONG_OPTS="guest-home:,guest-ip:,guest-intf:,guest-bus:,guest-num:,guest-cpu-mask:,\
 client-home:,client-ip:,client-intf:,client-num:,client-cpu-mask:,\
 host-home:,host-ip:,\
-exp-name:,mtu:,ddio:,bandwidth:,ring-buffer:,mlc-cores:,socket-buf:,dur:,runs:,ebpf-tracing:,mem-stats:,\
+exp-name:,mtu:,ddio:,bandwidth:,ring-buffer:,mlc-cores:,socket-buf:,dur:,runs:,ebpf-tracing:,mem-stats:,app:,\
 client-ssh-name:,client-ssh-host:,client-ssh-use-pass:,client-ssh-pass:,client-ssh-ifile:,help"
 
 PARSED_OPTS=$(getopt -a -n "$SCRIPT_NAME" --options "$SHORT_OPTS" --longoptions "$LONG_OPTS" -- "$@")
@@ -183,6 +185,7 @@ while :; do
         --runs) NUM_RUNS="$2"; shift 2 ;;
         --ebpf-tracing) EBPF_TRACING_ENABLED="$2"; shift 2 ;;
         --mem-stats) COLLECT_MEM_STATS="$2"; shift 2 ;;
+        --app) APP="$2"; shift 2 ;;
 	--client-ssh-name) CLIENT_SSH_UNAME="$2"; shift 2 ;;
         --client-ssh-host) CLIENT_SSH_HOST="$2"; shift 2 ;;
         --client-ssh-use-pass) CLIENT_USE_PASS_AUTH="$2"; shift 2 ;;
@@ -206,6 +209,13 @@ HOST_PERF="${HOST_HOME}/${HOST_PERF_REL}" # Path on host for perf
 EBPF_GUEST_LOADER="${GUEST_HOME}/${EBPF_GUEST_LOADER_REL}"
 EBPF_HOST_LOADER="${HOST_HOME}/${EBPF_HOST_LOADER_REL}"
 PROFILING_LOGGING_DUR_S=$((CORE_DURATION_S))
+
+# --- Workload roles: the guest sends, the client receives ---
+case "$APP" in
+    iperf) ;;
+    zc) GUEST_ZC_OP="send_zc"; CLIENT_ZC_OP="recv" ;;
+    *) echo "Unknown --app: $APP (expected iperf or zc)"; exit 2 ;;
+esac
 
 if [ "$CLIENT_USE_PASS_AUTH" -eq 1 ]; then
 	SSH_CLIENT_CMD="sshpass -p $CLIENT_SSH_PASSWORD ssh ${CLIENT_SSH_UNAME}@${CLIENT_SSH_HOST}"
@@ -316,7 +326,8 @@ cleanup() {
     $SSH_CLIENT_CMD \
         'screen -ls | grep -E "\.client_session|\.logging_session_client" | cut -d. -f1 | xargs -r -I % screen -S % -X quit'
     $SSH_CLIENT_CMD \
-        'sudo pkill -9 -f iperf; screen -wipe || true'
+        'sudo pkill -9 -f iperf; sudo pkill -9 -x zc_tput; screen -wipe || true'
+    sudo pkill -9 -x zc_tput
     $SSH_HOST_CMD \
 	'screen -ls | grep -E "\.host_session|\.perf_screen|\.perf_kvm_screen|\.perf_sched_screen|\.logging_session_host" | cut -d. -f1 | xargs -r -I % screen -S % -X quit'
     $SSH_HOST_CMD \
@@ -346,6 +357,50 @@ cleanup() {
     log_info "--- Cleanup Phase Finished ---"
 }
 
+# --- Zero-copy (--app zc) helpers ---
+# TCP_ZEROCOPY_RECEIVE maps payload pages only when each segment carries one
+# whole page (MTU 4148) and mlx5 splits headers from payload (hardware GRO).
+# Hardware GRO is forced off for iperf runs so a zc run cannot leak into them.
+set_guest_rx_gro_hw() {
+    local want=off
+    [ "$APP" = "zc" ] && want=on
+    sudo ethtool -K "$GUEST_INTF" rx-gro-hw "$want"
+    local got
+    got=$(ethtool -k "$GUEST_INTF" | awk '/^rx-gro-hw:/ {print $2}')
+    if [ "$got" != "$want" ]; then
+        log_error "rx-gro-hw on $GUEST_INTF is '$got', expected '$want'"
+        exit 1
+    fi
+    log_info "GUEST rx-gro-hw: $got"
+    ethtool -k "$GUEST_INTF" > "$current_guest_reports_dir/guest_offloads.txt"
+}
+
+check_zc_link() {
+    local guest_mtu client_mtu
+    guest_mtu=$(cat "/sys/class/net/$GUEST_INTF/mtu")
+    client_mtu=$($SSH_CLIENT_CMD "cat /sys/class/net/$CLIENT_INTF/mtu")
+    if [ "$guest_mtu" != "$MTU" ] || [ "$client_mtu" != "$MTU" ]; then
+        log_error "MTU mismatch: expected $MTU, GUEST=$guest_mtu CLIENT=$client_mtu"
+        exit 1
+    fi
+    log_info "MTU $MTU on GUEST and CLIENT"
+    echo "guest_mtu: $guest_mtu client_mtu: $client_mtu" > "$current_guest_reports_dir/zc_link.txt"
+}
+
+# Both machines build zc_tput from their own checkout; refuse to run if the
+# sources differ.
+check_zc_sources() {
+    local guest_sum client_sum
+    guest_sum=$(cd "$GUEST_EXP_DIR" && cat zc_tput.c zc_tput.sh | sha256sum | cut -d' ' -f1)
+    client_sum=$($SSH_CLIENT_CMD "cd '$CLIENT_EXP_DIR' && cat zc_tput.c zc_tput.sh | sha256sum | cut -d' ' -f1")
+    if [ -z "$guest_sum" ] || [ "$guest_sum" != "$client_sum" ]; then
+        log_error "zc_tput sources differ between GUEST ($guest_sum) and CLIENT ($client_sum)"
+        exit 1
+    fi
+    ZC_SOURCES_SHA256="$guest_sum"
+    log_info "zc_tput sources match on GUEST and CLIENT ($guest_sum)"
+}
+
 save_config_to_report_json() {
     local report_dir="${1:-$current_guest_reports_dir}"
     local config_file="$report_dir/config.json"
@@ -361,6 +416,8 @@ save_config_to_report_json() {
 {
   "timestamp": "$(date -Iseconds)",
   "test_params": {
+    "app": "$APP",
+    "zc_sources_sha256": "${ZC_SOURCES_SHA256:-}",
     "core_duration_s": "$CORE_DURATION_S",
     "mtu": "$MTU",
     "ddio_enabled": "$DDIO_ENABLED",
@@ -498,6 +555,7 @@ post_exp_cleanup() {
 }
 
 pre_exp_setup
+[ "$APP" = "zc" ] && check_zc_sources
 for ((j = 0; j < NUM_RUNS; j += 1)); do
     echo
     log_info "############################################################"
@@ -560,7 +618,11 @@ for ((j = 0; j < NUM_RUNS; j += 1)); do
     # --- Setup and Start Clients ---
     log_info "Setting up and starting CLIENTS on $CLIENT_SSH_HOST..."
     client_cmd="cd '$CLIENT_SETUP_DIR'; sudo bash setup-envir.sh --dep '$CLIENT_HOME' --intf '$CLIENT_INTF' --ip '$CLIENT_IP' -m '$MTU' -d '$DDIO_ENABLED' -r '$RING_BUFFER_SIZE' --socket-buf '$TCP_SOCKET_BUF_MB' --hwpref 1 --rdma 0 --pfc 0 --ecn 1 --opt 1; "
-    client_cmd+="cd '$CLIENT_EXP_DIR'; sudo bash run-tx-netapp-tput.sh --mode server -n '$GUEST_NUM_SERVERS' -N '$CLIENT_NUM_CLIENTS'  -o '${EXP_NAME}-RUN-${j}' -p '$INIT_PORT' -c '$CLIENT_CPU_MASK' &> '$client_server_app_log_file'; exec bash"
+    if [ "$APP" = "zc" ]; then
+        client_cmd+="cd '$CLIENT_EXP_DIR'; sudo bash zc_tput.sh --mode server --op '$CLIENT_ZC_OP' -n '$GUEST_NUM_SERVERS' -N '$CLIENT_NUM_CLIENTS' -o '${EXP_NAME}-RUN-${j}' -p '$INIT_PORT' -c '$CLIENT_CPU_MASK' &> '$client_server_app_log_file'; exec bash"
+    else
+        client_cmd+="cd '$CLIENT_EXP_DIR'; sudo bash run-tx-netapp-tput.sh --mode server -n '$GUEST_NUM_SERVERS' -N '$CLIENT_NUM_CLIENTS'  -o '${EXP_NAME}-RUN-${j}' -p '$INIT_PORT' -c '$CLIENT_CPU_MASK' &> '$client_server_app_log_file'; exec bash"
+    fi
     $SSH_CLIENT_CMD "screen -dmS client_session sudo bash -c \"$client_cmd\""
     sleep 2
 
@@ -570,6 +632,7 @@ for ((j = 0; j < NUM_RUNS; j += 1)); do
     sudo bash setup-envir.sh --dep "$GUEST_HOME" --intf "$GUEST_INTF" --ip "$GUEST_IP" -m "$MTU" -d "$DDIO_ENABLED" -r "$RING_BUFFER_SIZE" \
         --socket-buf "$TCP_SOCKET_BUF_MB" --hwpref 1 --rdma 0 --pfc 0 --ecn 1 --opt 1 --nic-bus "$GUEST_NIC_BUS"
     cd - > /dev/null # Go back to previous directory silently
+    set_guest_rx_gro_hw
 
      # --- Setup Host Environment ---
     log_info "Setting up HOST environment on $HOST_IP..."
@@ -593,8 +656,13 @@ for ((j = 0; j < NUM_RUNS; j += 1)); do
     log_info "Starting GUEST server application; logs at $guest_server_app_log_file"
     cd "$GUEST_EXP_DIR" || { log_error "Failed to cd to $GUEST_EXP_DIR"; exit 1; }
     # echo "sudo bash run-tx-netapp-tput.sh --mode client --server-ip '$CLIENT_IP' -n "$GUEST_NUM_SERVERS" -N "$CLIENT_NUM_CLIENTS" -o "${EXP_NAME}-RUN-${j}" -p "$INIT_PORT" -c "$GUEST_CPU_MASK" --b '$CLIENT_BANDWIDTH' &> "$guest_server_app_log_file""
-    sudo bash run-tx-netapp-tput.sh --mode client --server-ip "$CLIENT_IP" -n "$GUEST_NUM_SERVERS" -N "$CLIENT_NUM_CLIENTS" -o "${EXP_NAME}-RUN-${j}" \
-        -p "$INIT_PORT" -c "$GUEST_CPU_MASK" --b "$CLIENT_BANDWIDTH" &> "$guest_server_app_log_file" & 
+    if [ "$APP" = "zc" ]; then
+        sudo bash zc_tput.sh --mode client --op "$GUEST_ZC_OP" --server-ip "$CLIENT_IP" -n "$GUEST_NUM_SERVERS" -N "$CLIENT_NUM_CLIENTS" -o "${EXP_NAME}-RUN-${j}" \
+            -p "$INIT_PORT" -c "$GUEST_CPU_MASK" &> "$guest_server_app_log_file" &
+    else
+        sudo bash run-tx-netapp-tput.sh --mode client --server-ip "$CLIENT_IP" -n "$GUEST_NUM_SERVERS" -N "$CLIENT_NUM_CLIENTS" -o "${EXP_NAME}-RUN-${j}" \
+            -p "$INIT_PORT" -c "$GUEST_CPU_MASK" --b "$CLIENT_BANDWIDTH" &> "$guest_server_app_log_file" & 
+    fi
     sleep 2 # Allow server app to initialize
     cd - > /dev/null   
 
@@ -603,6 +671,7 @@ for ((j = 0; j < NUM_RUNS; j += 1)); do
     # progress_bar 10 1
     log_info "Warming up experiment (60 seconds)..."
     progress_bar 60 1
+    [ "$APP" = "zc" ] && check_zc_link
 
     save_pcpu_queue_stats "$current_guest_reports_dir/pcpu_queue_stats.txt" "after_warmup"
 
@@ -753,7 +822,11 @@ for ((j = 0; j < NUM_RUNS; j += 1)); do
     progress_bar $((CORE_DURATION_S * 2)) 2
 
     save_pcpu_queue_stats "$current_guest_reports_dir/pcpu_queue_stats.txt" "after_data_collection"
-    sudo bash collect-period-tput.sh "$EXP_NAME-RUN-${j}"
+    if [ "$APP" = "zc" ]; then
+        sudo python3 collect-zc-tput.py run "$EXP_NAME-RUN-${j}" "$GUEST_ZC_OP" || log_error "Run $j is not a valid zero-copy run (see zc.rpt)"
+    else
+        sudo bash collect-period-tput.sh "$EXP_NAME-RUN-${j}"
+    fi
 
     # --- Post-run cleanup ---
     # cleanup
@@ -782,11 +855,20 @@ else
     sudo python3 vm-tx-collect-tput-stats.py "$EXP_NAME" "$NUM_RUNS" 0 # TODO: Change back to 1
 fi
 
-for run in $(seq 0 $((NUM_RUNS - 1))); do
-    run_reports_dir="${GUEST_SETUP_DIR}/reports/${EXP_NAME}-RUN-${run}"
-    sudo python3 collect-per-core-stats.py "$EXP_NAME-RUN-$run" | sudo tee "${run_reports_dir}/per-core-stats.txt"
-done
+# Per-core stats parse iperf3 logs, so they exist only for iperf runs.
+if [ "$APP" = "iperf" ]; then
+    for run in $(seq 0 $((NUM_RUNS - 1))); do
+        run_reports_dir="${GUEST_SETUP_DIR}/reports/${EXP_NAME}-RUN-${run}"
+        sudo python3 collect-per-core-stats.py "$EXP_NAME-RUN-$run" | sudo tee "${run_reports_dir}/per-core-stats.txt"
+    done
+fi
 
 sync
 sleep 1
+if [ "$APP" = "zc" ]; then
+    sudo python3 collect-zc-tput.py summary "$EXP_NAME" "$NUM_RUNS" || log_error "Some runs of $EXP_NAME are not valid zero-copy runs"
+    # Leave the guest NIC as iperf scripts on other branches expect it.
+    sudo ethtool -K "$GUEST_INTF" rx-gro-hw off
+fi
+
 log_info "Experiment $EXP_NAME finished."

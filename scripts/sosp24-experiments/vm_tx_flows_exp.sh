@@ -138,11 +138,25 @@ timestamp=$(date '+%Y-%m-%d-%H-%M-%S')
 N_RUNS=5
 Z_LIST_DLF="1"
 
+# APP=iperf reproduces the main figures (iperf3, MTU 4000, flows 1-32).
+# APP=zc runs the zero-copy figure: zc_tput with MSG_ZEROCOPY sends from the guest,
+# MTU 4148 (one 4 KB page of payload per segment) and hardware GRO on in the guest.
+APP=zc
+if [ "$APP" = "zc" ]; then
+    MTU=4148
+    FLOW_COUNTS="4 8 12 16 20 24"
+    TAG="TX-ZC"
+else
+    MTU=4000
+    FLOW_COUNTS="1 4 8 12 16 20 24 28 32"
+    TAG="TX"
+fi
+
 for socket_buf in 1; do
     for ring_buffer in 512; do
         for i in 1; do
             # for num_cores in 1 4 8 12 16 20 24; do
-            for num_cores in 1 4 8 12 16 20 24 28 32; do
+            for num_cores in $FLOW_COUNTS; do
                 client_cores_mask=($(echo $client_cores | tr ',' '\n' | head -n $num_cores | tr '\n' ','))
                 server_cores_mask=($(echo $server_cores | tr ',' '\n' | head -n $num_cores | tr '\n' ','))
 
@@ -165,12 +179,12 @@ for socket_buf in 1; do
                 for z in $run_list; do
                     if [ "$z" != "default" ]; then
                         # DLF Setup
-                        exp_name="${timestamp}-$(uname -r)-TX-flow${format_i}-${iommu_config}-${num_cores}cores-ringbuf${ring_buffer}-sockbuf${socket_buf}-zval${z}"
+                        exp_name="${timestamp}-$(uname -r)-${TAG}-flow${format_i}-${iommu_config}-${num_cores}cores-ringbuf${ring_buffer}-sockbuf${socket_buf}-zval${z}"
                         echo $z | sudo tee /sys/kernel/debug/iommu/leader_max_flushes
                         echo "Leader Max Flushes: $(sudo cat /sys/kernel/debug/iommu/leader_max_flushes)"
                     else
                         # Standard Setup
-                        exp_name="${timestamp}-$(uname -r)-TX-flow${format_i}-${iommu_config}-${num_cores}cores-ringbuf${ring_buffer}-sockbuf${socket_buf}"
+                        exp_name="${timestamp}-$(uname -r)-${TAG}-flow${format_i}-${iommu_config}-${num_cores}cores-ringbuf${ring_buffer}-sockbuf${socket_buf}"
                     fi
 
                     echo $exp_name
@@ -186,8 +200,8 @@ for socket_buf in 1; do
                         --client-home "$CLIENT_HOME" --client-ip "$CLIENT_IP" --client-intf "$CLIENT_INTF" -N "$n_val" -C $client_cores_mask \
                         --host-home "$HOST_HOME" --host-ip "$HOST_IP" \
                         --client-ssh-name "$CLIENT_SSH_UNAME" --client-ssh-pass "$CLIENT_SSH_PASSWORD" --client-ssh-host "$CLIENT_SSH_HOST" --client-ssh-use-pass "$CLIENT_USE_PASS_AUTH" --client-ssh-ifile "$CLIENT_SSH_IDENTITY_FILE" \
-                        -e "$exp_name" -m 4000 -r $ring_buffer -b "400g" -d 1\
-                        --socket-buf $socket_buf --mlc-cores 'none' --runs $N_RUNS 2>&1 | sudo tee ../utils/reports/$exp_name/experiment.log
+                        -e "$exp_name" -m "$MTU" -r $ring_buffer -b "400g" -d 1\
+                        --socket-buf $socket_buf --mlc-cores 'none' --runs $N_RUNS --app "$APP" 2>&1 | sudo tee ../utils/reports/$exp_name/experiment.log
 
                     python3 report-tput-metrics.py $exp_name tput,drops,acks,iommu,cpu | sudo tee ../utils/reports/$exp_name/summary.txt
                     echo $PWD
