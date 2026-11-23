@@ -254,7 +254,7 @@ if [ "$TYPE" -eq 0 ]; then
 
     if [ "$CPU_UTIL_REPORTING" -eq 1 ]; then
       echo "Collecting CPU utilization for cores $CPU_MASK..." 
-      # Start/end of the sampled interval; collect-zc-tput.py measures throughput over it.
+      # Start/end of the sampled interval; collect-zc-tput.py measures CPU cost (and in-window throughput) over it.
       date +%s.%N > reports/$OUT_DIR/cpu_util.window
       sar -P $CPU_MASK 1 1000 > logs/$OUT_DIR/cpu_util.log &
       sleep $DURATION_S
