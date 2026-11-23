@@ -125,8 +125,11 @@ virt_tech=$(detect_virt_tech)
 if [ $? -ne 0 ]; then
     echo "Failed to detect virtualization technology"
     echo "Running in baremetal, so probably not a problem"
-    #exit 1
+    exit 1
 fi
+
+# Client SMT off
+$SSH_CLIENT_CMD "echo off | sudo tee /sys/devices/system/cpu/smt/control"
 
 iommu_config="host-${host_iommu_config}-guest-${guest_iommu_config}-$virt_tech"
 echo "iommu_config: $iommu_config"
